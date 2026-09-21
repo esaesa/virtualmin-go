@@ -1,0 +1,6 @@
+desc=Go Application Deployments
+version=0.1.0
+category=servers
+depends=virtual-server/4.13
+os_support=*-linux
+hidden=0

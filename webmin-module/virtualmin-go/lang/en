@@ -1,0 +1,31 @@
+# Virtualmin Go - English locale strings
+
+# Feature metadata
+feat_name=Go Application
+feat_label=Allow Go application?
+feat_label2=Go application
+feat_losing=Go will be disabled for this server. The application directory will be preserved
+feat_disname=Go service will be stopped and Apache proxy removed
+feat_backup_name=Go application data and configuration
+feat_module=Virtualmin Go (for managing applications)
+
+# Dependency checks
+feat_check_cli=The CLI manager $1 is not installed. Install the virtualmin-go package first.
+feat_check_systemd=systemd is required but not found.
+feat_check_apache=Apache is required but not found.
+feat_edepweb=Go requires the website feature to be enabled.
+
+# Setup / Delete / Enable / Disable
+feat_setup=Setting up Go for $1 ..
+feat_setup_done=.. done
+feat_delete=Removing Go for $1 ..
+feat_disable=Disabling Go for $1 ..
+feat_enable=Enabling Go for $1 ..
+feat_modify_warn=Warning: Go migration after domain rename is not automated in V1.
+feat_modify_warn2=Run validate and redeploy.
+
+# Clash / Import
+feat_clash=Go is already configured for this domain
+
+# Status
+theme_title=Go Applications

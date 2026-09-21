@@ -1,0 +1,8 @@
+cli=Path to virtualmin-go CLI,0
+command_timeout=CLI command timeout in seconds,0
+max_output_bytes=Maximum captured CLI output bytes,0
+max_log_lines=Maximum log lines per request,0
+report_dir=Private report directory,0
+backup_dir=Private Go backup directory,0
+lock_dir=Operation lock directory,0
+audit_log=Private JSON-lines audit log,0

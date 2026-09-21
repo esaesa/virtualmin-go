@@ -1,0 +1,1879 @@
+#!/usr/bin/env bash
+# Virtualmin Go - root CLI manager for versioned Go application deployments
+# Copyright (C) 2026 Islam Sameh
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+# virtualmin-go — Root CLI manager for Go application instances
+# Version: 0.1.0
+set -euo pipefail
+
+###############################################################################
+# Globals
+###############################################################################
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_VERSION="0.1.0"
+readonly LOCK_DIR="/tmp/virtualmin-go/locks"
+readonly INSTANCES_DIR="/etc/virtualmin-go/instances.d"
+readonly CONFIG_FILE="/etc/virtualmin-go/config"
+readonly CONFIG_DEFAULT="/etc/virtualmin-go/config.default"
+readonly BACKUP_BASE="/etc/virtualmin-go/backups"
+readonly CHANGE_BASE="/root"
+
+# Defaults (overridden by /etc/virtualmin-go/config)
+GO_BASE_PORT=18100
+GO_MAX_PORT=18199
+GO_LISTEN_HOST="127.0.0.1"
+GO_APP_SUBDIR="apps/go"
+GO_DEFAULT_PROXY_PATH="/"
+GO_DEFAULT_HEALTH_PATH="/health"
+GO_DEFAULT_READY_PATH="/ready"
+GO_HEALTH_TIMEOUT=15
+GO_HEALTH_RETRIES=10
+GO_KEEP_RELEASES=5
+GO_DEFAULT_LIMIT_NOFILE=65535
+GO_RESTART_POLICY="on-failure"
+GO_RESTART_SEC=2
+GO_APACHE_TIMEOUT=60
+
+###############################################################################
+# Helpers
+###############################################################################
+die() { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARN: $*" >&2; }
+info() { echo "$*"; }
+
+cleanup_lock() {
+    release_lock 9 2>/dev/null || true
+}
+
+trap cleanup_lock EXIT
+
+require_root() {
+    [[ "$(id -u)" -eq 0 ]] || die "This command must run as root."
+}
+
+load_config() {
+    mkdir -p "$LOCK_DIR" "$INSTANCES_DIR" "$BACKUP_BASE" 2>/dev/null || true
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    elif [[ -f "$CONFIG_DEFAULT" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_DEFAULT"
+    fi
+    : "${GO_BASE_PORT:=18100}"
+    : "${GO_MAX_PORT:=18199}"
+    : "${GO_LISTEN_HOST:=127.0.0.1}"
+    : "${GO_APP_SUBDIR:=apps/go}"
+}
+
+validate_domain_arg() {
+    local domain="$1"
+    [[ ${#domain} -ge 3 && ${#domain} -le 253 ]] || die "Invalid domain: $domain"
+    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "Invalid domain: $domain"
+    [[ "$domain" != *..* ]] || die "Invalid domain: $domain"
+}
+
+###############################################################################
+# SERVER_HOME resolution (same rule as virtualmin-pocketbase — never guess)
+###############################################################################
+get_server_home_field() {
+    local domain="$1"
+    local field="$2"
+    local multi line
+    multi="$(virtualmin list-domains --multiline --domain "$domain" 2>/dev/null)"
+    line="$(printf '%s\n' "$multi" | sed -n "s/^ *${field}: //p" | head -1)"
+    printf '%s' "$line"
+}
+
+resolve_domain() {
+    local domain="$1"
+    local dname duser dhome
+
+    if command -v virtualmin &>/dev/null; then
+        dhome="$(get_server_home_field "$domain" "Home directory")"
+        duser="$(get_server_home_field "$domain" "Username")"
+        if [[ -z "$dhome" || -z "$duser" ]]; then
+            local row
+            row="$(virtualmin list-domains --domain "$domain" 2>/dev/null | awk -v dom="$domain" '$1 == dom {print $0; exit}')"
+            if [[ -z "$row" && -z "$dhome" ]]; then
+                die "Domain $domain was not found in Virtualmin."
+            fi
+            dname="$domain"
+            if [[ -z "$duser" ]]; then
+                duser="$(printf '%s\n' "$row" | awk '{print $2}')"
+            fi
+            if [[ -z "$dhome" ]]; then
+                die "Could not determine Virtualmin home directory for $domain."
+            fi
+        else
+            dname="$domain"
+        fi
+        [[ -n "$duser" ]] || die "Could not determine user for domain $domain."
+        [[ -n "$dhome" ]] || die "Could not determine home directory for domain $domain."
+    else
+        dname="$domain"
+        duser=""
+        dhome=""
+        for conf in "$INSTANCES_DIR"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            if grep -q "^DOMAIN='$domain'" "$conf" 2>/dev/null; then
+                duser="$(grep "^USER=" "$conf" 2>/dev/null | cut -d"'" -f2 || true)"
+                dhome="$(grep "^HOME=" "$conf" 2>/dev/null | cut -d"'" -f2 || true)"
+                break
+            fi
+        done
+        [[ -n "$duser" ]] || die "Could not determine user for domain $domain. Is Virtualmin installed?"
+        [[ -n "$dhome" ]] || die "Could not determine home directory for domain $domain."
+    fi
+
+    echo "$dname"
+    echo "$duser"
+    echo "$dhome"
+}
+
+# Safety: APP_ROOT must be exactly $SERVER_HOME/apps/go. Never allow
+# SERVER_HOME itself, public_html, logs, /home, / or empty values.
+assert_safe_app_root() {
+    local app_root="$1"
+    local server_home="$2"
+    [[ -n "$app_root" ]] || die "Refusing to operate on empty app directory."
+    [[ "$app_root" == "$server_home/$GO_APP_SUBDIR" ]] || \
+        die "Refusing to operate outside Go app scope: $app_root (server home: $server_home)"
+}
+
+get_domain_info() {
+    local domain="$1"
+    local info
+    info="$(resolve_domain "$domain")"
+    RESOLVED_DOMAIN="$(echo "$info" | sed -n '1p')"
+    RESOLVED_USER="$(echo "$info" | sed -n '2p')"
+    RESOLVED_HOME="$(echo "$info" | sed -n '3p')"
+}
+
+###############################################################################
+# Locks
+###############################################################################
+acquire_lock() {
+    local lock_name="$1"
+    local lock_file="${LOCK_DIR}/${lock_name}.lock"
+    mkdir -p "$LOCK_DIR"
+    exec 9>"$lock_file"
+    flock -n 9 || die "Could not acquire lock: $lock_name (another operation in progress?)"
+}
+
+release_lock() {
+    local fd="${1:-9}"
+    flock -u "$fd" 2>/dev/null || true
+}
+
+get_port_allocator_lock() {
+    acquire_lock "port-allocation"
+}
+
+get_domain_lock() {
+    local domain="$1"
+    acquire_lock "domain-${domain}"
+}
+
+###############################################################################
+# Release symlink convention: current/previous -> releases/<id>, relative to
+# $APP_ROOT. Helpers keep every consumer in ID space (never raw targets).
+###############################################################################
+link_id() {
+    local link="$1" tgt=""
+    tgt="$(readlink "$link" 2>/dev/null || true)"
+    tgt="$(basename "$tgt")"
+    [[ "$tgt" == "/" || "$tgt" == "." || "$tgt" == "" ]] && { printf ''; return 0; }
+    printf '%s' "$tgt"
+}
+
+set_link() {
+    local link="$1" id="$2" user="$3"
+    [[ -n "$id" ]] || die "Refusing to point $link at empty release id."
+    [[ "$id" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Unsafe release id: $id"
+    ln -sfn "releases/$id" "$link"
+    [[ -n "$user" ]] && chown -h "$user:$user" "$link" 2>/dev/null || true
+}
+
+release_dir_ok() {
+    local id="$1"
+    [[ -n "$id" && -d "$RELEASES_DIR/$id" ]]
+}
+
+###############################################################################
+# Instance layout: $SERVER_HOME/apps/go
+###############################################################################
+build_go_paths() {
+    local server_home="$1"
+    GO_APP_ROOT="${server_home}/${GO_APP_SUBDIR}"
+    GO_RELEASES_DIR="${GO_APP_ROOT}/releases"
+    GO_CURRENT_LINK="${GO_APP_ROOT}/current"
+    GO_PREVIOUS_LINK="${GO_APP_ROOT}/previous"
+    GO_CONFIG_DIR="${GO_APP_ROOT}/config"
+    GO_PROD_ENV="${GO_CONFIG_DIR}/production.env"
+    GO_DATA_DIR="${GO_APP_ROOT}/data"
+    GO_UPLOADS_DIR="${GO_DATA_DIR}/uploads"
+    GO_RESULTS_DIR="${GO_DATA_DIR}/results"
+    GO_MODELS_DIR="${GO_APP_ROOT}/models"
+    GO_TMP_DIR="${GO_APP_ROOT}/tmp"
+    GO_META_FILE="${GO_APP_ROOT}/.virtualmin-go.env"
+}
+
+ensure_go_tree() {
+    local user="$1" group="$2"
+    local parent_dir
+    parent_dir="$(dirname "$GO_APP_ROOT")"
+    mkdir -p "$parent_dir" "$GO_APP_ROOT" "$GO_RELEASES_DIR" \
+        "$GO_CONFIG_DIR" "$GO_DATA_DIR" "$GO_UPLOADS_DIR" "$GO_RESULTS_DIR" \
+        "$GO_MODELS_DIR" "$GO_TMP_DIR"
+    chown "$user:$group" "$parent_dir" "$GO_APP_ROOT"
+    chown -R "$user:$group" "$GO_RELEASES_DIR" "$GO_CONFIG_DIR" \
+        "$GO_DATA_DIR" "$GO_MODELS_DIR" "$GO_TMP_DIR"
+    chmod 0750 "$parent_dir" "$GO_APP_ROOT"
+    chmod 0750 "$GO_RELEASES_DIR" "$GO_CONFIG_DIR" "$GO_DATA_DIR" \
+        "$GO_MODELS_DIR" "$GO_TMP_DIR"
+}
+
+# production.env holds secrets + app environment. Created once at enable,
+# never overwritten by deploy/rollback. 0600, owned by the domain user.
+ensure_prod_env() {
+    local user="$1" group="$2" port="$3"
+    if [[ ! -f "$GO_PROD_ENV" ]]; then
+        cat > "$GO_PROD_ENV" << EOF
+# Managed by virtualmin-go. Secrets and app environment live here.
+# This file is NEVER overwritten by deploy or rollback.
+# Add your application secrets below (KEY=value, one per line).
+GO_ADDR='${GO_LISTEN_HOST}:${port}'
+GO_PORT='${port}'
+EOF
+        chown "$user:$group" "$GO_PROD_ENV"
+        chmod 0600 "$GO_PROD_ENV"
+    else
+        chown "$user:$group" "$GO_PROD_ENV"
+        chmod 0600 "$GO_PROD_ENV"
+    fi
+}
+
+# .virtualmin-go.env holds module-owned metadata only. No secrets.
+write_meta_file() {
+    local user="$1" group="$2" port="$3" proxy_path="$4" version="$5" health_path="$6" deploy_id="$7"
+    cat > "$GO_META_FILE" << EOF
+GO_PORT='${port}'
+GO_PROXY_PATH='${proxy_path}'
+GO_CURRENT_VERSION='${version}'
+GO_HEALTH_PATH='${health_path}'
+GO_DEPLOY_ID='${deploy_id}'
+EOF
+    chown "$user:$group" "$GO_META_FILE"
+    chmod 0640 "$GO_META_FILE"
+}
+
+write_registry() {
+    local registry="$1" domain="$2" user="$3" group="$4" home="$5"
+    local port="$6" proxy_path="$7" health_path="$8" ready_path="$9"
+    local version="${10}" deploy_id="${11}" entrypoint="${12}" sha="${13}"
+    local enabled="${14}" apache_kind="${15}" apache_vhost="${16}"
+    local unit="virtualmin-go-${domain}.service"
+    cat > "$registry" << EOF
+DOMAIN='${domain}'
+USER='${user}'
+GROUP='${group}'
+HOME='${home}'
+APP_ROOT='${GO_APP_ROOT}'
+RELEASES_DIR='${GO_RELEASES_DIR}'
+CURRENT_LINK='${GO_CURRENT_LINK}'
+PREVIOUS_LINK='${GO_PREVIOUS_LINK}'
+CONFIG_DIR='${GO_CONFIG_DIR}'
+PROD_ENV='${GO_PROD_ENV}'
+DATA_DIR='${GO_DATA_DIR}'
+MODELS_DIR='${GO_MODELS_DIR}'
+TMP_DIR='${GO_TMP_DIR}'
+META_FILE='${GO_META_FILE}'
+SERVICE_NAME='${unit}'
+SYSTEMD_UNIT='/etc/systemd/system/${unit}'
+LISTEN_HOST='${GO_LISTEN_HOST}'
+PORT='${port}'
+PROXY_PATH='${proxy_path}'
+HEALTH_PATH='${health_path}'
+READY_PATH='${ready_path}'
+CURRENT_VERSION='${version}'
+DEPLOY_ID='${deploy_id}'
+ENTRYPOINT='${entrypoint}'
+DEPLOY_SHA256='${sha}'
+ENABLED='${enabled}'
+APACHE_VHOST_FILE='${apache_vhost}'
+APACHE_CONFIG_KIND='${apache_kind}'
+CREATED_AT='$(date -Iseconds)'
+MANAGED_BY='virtualmin-go'
+EOF
+    chmod 0640 "$registry"
+}
+
+###############################################################################
+# Port allocator: 18100-18199, registry + live-listener conflict detection
+###############################################################################
+alloc_go_port() {
+    local wanted="${1:-}"
+    local used_ports=()
+    local conf p
+    for conf in "$INSTANCES_DIR"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        p="$(grep "^PORT=" "$conf" 2>/dev/null | cut -d"'" -f2 || true)"
+        [[ -n "$p" ]] && used_ports+=("$p")
+    done
+    local listening
+    listening="$(ss -ltn 2>/dev/null | awk '/127\.0\.0\.1:/ {gsub(/.*:/,"",$4); print $4}' || true)"
+
+    if [[ -n "$wanted" ]]; then
+        [[ "$wanted" -ge "$GO_BASE_PORT" && "$wanted" -le "$GO_MAX_PORT" ]] || \
+            die "Port $wanted outside Go range $GO_BASE_PORT-$GO_MAX_PORT."
+        for up in ${used_ports[@]+"${used_ports[@]}"}; do
+            [[ "$wanted" == "$up" ]] && die "Port $wanted already reserved by another Go instance."
+        done
+        echo "$listening" | grep -qw "$wanted" && die "Port $wanted already listening on 127.0.0.1."
+        printf '%s' "$wanted"
+        return 0
+    fi
+
+    for (( p=GO_BASE_PORT; p<=GO_MAX_PORT; p++ )); do
+        local in_use=0
+        for up in ${used_ports[@]+"${used_ports[@]}"}; do
+            [[ "$p" == "$up" ]] && { in_use=1; break; }
+        done
+        [[ "$in_use" == "0" ]] || continue
+        if ! echo "$listening" | grep -qw "$p"; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    die "Port range $GO_BASE_PORT-$GO_MAX_PORT has no free ports."
+}
+
+###############################################################################
+# systemd
+###############################################################################
+write_go_systemd_unit() {
+    local unit_file="$1" domain="$2" user="$3" group="$4"
+    local entrypoint_abs="$5" port="$6"
+    local nofile="${GO_DEFAULT_LIMIT_NOFILE:-65535}"
+    cat > "$unit_file" << UNITEOF
+[Unit]
+Description=Go application for ${domain} (virtualmin-go)
+After=network.target
+
+[Service]
+Type=simple
+User=${user}
+Group=${group}
+WorkingDirectory=${GO_APP_ROOT}
+EnvironmentFile=${GO_PROD_ENV}
+Environment=GO_ADDR=${GO_LISTEN_HOST}:${port}
+Environment=GO_PORT=${port}
+ExecStart=${entrypoint_abs}
+Restart=${GO_RESTART_POLICY:-on-failure}
+RestartSec=${GO_RESTART_SEC:-2}
+LimitNOFILE=${nofile}
+UMask=0027
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=${GO_APP_ROOT}
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+StandardOutput=append:${GO_APP_ROOT}/go.log
+StandardError=append:${GO_APP_ROOT}/go.log
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+    chmod 0644 "$unit_file"
+}
+
+systemd_daemon_reload() {
+    systemctl daemon-reload
+}
+
+###############################################################################
+# HTTP helpers
+###############################################################################
+http_status_code() {
+    local url="$1" code
+    code="$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)" || code="000"
+    [[ "$code" =~ ^[0-9]+$ ]] || code="000"
+    printf '%s' "$code"
+}
+
+url_responds_ok() {
+    local url="$1"
+    local code
+    code="$(http_status_code "$url")"
+    case "$code" in
+        2*|3*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+wait_for_health() {
+    local port="$1" health_path="$2"
+    local retries="${GO_HEALTH_RETRIES:-10}"
+    local i code
+    for (( i=1; i<=retries; i++ )); do
+        code="$(http_status_code "http://${GO_LISTEN_HOST}:${port}${health_path}")"
+        case "$code" in
+            2*|3*) return 0 ;;
+        esac
+        sleep 1
+    done
+    return 1
+}
+
+###############################################################################
+# Apache (transactional, own markers only, coexists with PocketBase /pb/)
+###############################################################################
+find_apache_vhost_file() {
+    local domain="$1"
+    local f
+    for f in "/etc/apache2/sites-available/${domain}.conf" \
+             "/etc/apache2/sites-enabled/${domain}.conf" \
+             "/etc/httpd/conf.d/${domain}.conf"; do
+        [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+    # Fallback: grep ServerName across available vhosts
+    local hit
+    hit="$(grep -rl "ServerName ${domain}" /etc/apache2/sites-available/ 2>/dev/null | head -1 || true)"
+    if [[ -n "$hit" ]]; then
+        printf '%s' "$hit"
+        return 0
+    fi
+    die "Could not locate Apache vhost file for $domain."
+}
+
+write_go_proxy_block() {
+    local port="$1" domain="$2"
+    local remoteip_block=""
+    if apachectl -M 2>/dev/null | grep -qi 'remoteip_module'; then
+        remoteip_block=$'\nRemoteIPHeader X-Forwarded-For\nRemoteIPTrustedProxy 127.0.0.1'
+    fi
+    cat << EOF
+# BEGIN VIRTUALMIN-GO ${domain}
+ProxyPreserveHost On
+ProxyRequests Off
+
+RequestHeader set X-Forwarded-Proto "https"
+RequestHeader set X-Forwarded-Port "443"
+RequestHeader set X-Forwarded-For "%{X-Forwarded-For}i"
+RequestHeader set X-Real-IP "%{X-Real-IP}s"${remoteip_block}
+
+ProxyPass / http://127.0.0.1:${port}/ timeout=${GO_APACHE_TIMEOUT:-60} retry=0
+ProxyPassReverse / http://127.0.0.1:${port}/
+# END VIRTUALMIN-GO ${domain}
+EOF
+}
+
+# Insert our block INSIDE the :443 vhost, AFTER any PocketBase block so that
+# the specific /pb/ ProxyPass sorts before our / catch-all. Never touches
+# /.well-known exclusions, redirects, or SSL directives.
+insert_go_block_into_vhost() {
+    local vhost_file="$1" domain="$2" block="$3"
+    local tmp_vhost marker
+    tmp_vhost="$(mktemp)"
+    marker="# END VIRTUALMIN-POCKETBASE $domain"
+    if ! awk -v domain="$domain" -v block="$block" -v marker="$marker" '
+        $0 ~ /<VirtualHost/ {
+            invhost = ($0 ~ ":443>")
+        }
+        invhost && !done && index($0, marker) {
+            print
+            print block
+            done = 1
+            next
+        }
+        invhost && !done && /<\/VirtualHost>/ {
+            print block
+            done = 1
+        }
+        { print }
+        END {
+            if (!done) { exit 1 }
+        }
+    ' "$vhost_file" > "$tmp_vhost"; then
+        rm -f "$tmp_vhost"
+        die "Failed to insert Go proxy block into :443 VirtualHost in $vhost_file"
+    fi
+    # Sanity: exactly one managed block for this domain.
+    local count
+    count="$(grep -c "BEGIN VIRTUALMIN-GO ${domain}" "$tmp_vhost" || true)"
+    [[ "$count" == "1" ]] || { rm -f "$tmp_vhost"; die "Expected 1 Go block, found $count."; }
+    mv "$tmp_vhost" "$vhost_file"
+    chmod 0644 "$vhost_file"
+}
+
+# Remove ONLY our own managed block. Never touches /pb/ or anything else.
+remove_go_block_from_vhost() {
+    local vhost_file="$1" domain="$2"
+    [[ -f "$vhost_file" ]] || return 0
+    grep -q "BEGIN VIRTUALMIN-GO ${domain}" "$vhost_file" || return 0
+    local tmp_vhost
+    tmp_vhost="$(mktemp)"
+    awk -v domain="$domain" '
+        /BEGIN VIRTUALMIN-GO/ && index($0, domain) { skip=1; next }
+        /END VIRTUALMIN-GO/ && index($0, domain) { skip=0; next }
+        !skip { print }
+    ' "$vhost_file" > "$tmp_vhost"
+    mv "$tmp_vhost" "$vhost_file"
+    chmod 0644 "$vhost_file"
+}
+
+go_block_present() {
+    local vhost_file="$1" domain="$2"
+    [[ -f "$vhost_file" ]] && grep -q "BEGIN VIRTUALMIN-GO ${domain}" "$vhost_file" 2>/dev/null
+}
+
+create_change_backup() {
+    local ts
+    ts="$(date +%F-%H%M%S)"
+    local backup_dir="${CHANGE_BASE}/virtualmin-go-change-${ts}"
+    mkdir -p "$backup_dir"
+    echo "$backup_dir"
+}
+
+add_changed_file() {
+    local backup_dir="$1" file="$2"
+    if [[ -f "$file" ]]; then
+        local rel dest
+        rel="$(echo "$file" | sed 's|^/||')"
+        dest="${backup_dir}/${rel}"
+        mkdir -p "$(dirname "$dest")"
+        cp -a "$file" "$dest"
+        echo "$file" >> "${backup_dir}/changed-files.txt"
+    fi
+}
+
+apache_configtest_or_restore() {
+    local backup_dir="$1" apache_file="$2"
+    if apachectl configtest 2>/dev/null; then
+        return 0
+    fi
+    warn "Apache configtest failed — restoring $apache_file from backup."
+    local apache_backup
+    apache_backup="$(find "$backup_dir" -path "*/etc/apache2/*" -name "$(basename "$apache_file")" 2>/dev/null | head -1)"
+    if [[ -n "$apache_backup" && -f "$apache_backup" ]]; then
+        cp -a "$apache_backup" "$apache_file"
+        if apachectl configtest 2>/dev/null; then
+            systemctl reload apache2 2>/dev/null || systemctl reload httpd 2>/dev/null || true
+        fi
+    fi
+    die "Apache configtest failed. Changes rolled back."
+}
+
+safe_reload_apache() {
+    if systemctl reload apache2 2>/dev/null; then
+        return 0
+    elif systemctl reload httpd 2>/dev/null; then
+        return 0
+    else
+        warn "Apache reload failed. Service may still be running."
+        return 1
+    fi
+}
+
+# Apply (or refresh) the Go proxy block transactionally.
+apply_go_apache() {
+    local vhost_file="$1" domain="$2" port="$3"
+    local backup_dir="$4"
+    add_changed_file "$backup_dir" "$vhost_file"
+    remove_go_block_from_vhost "$vhost_file" "$domain"
+    local block
+    block="$(write_go_proxy_block "$port" "$domain")"
+    insert_go_block_into_vhost "$vhost_file" "$domain" "$block"
+    apache_configtest_or_restore "$backup_dir" "$vhost_file"
+    safe_reload_apache || true
+}
+
+# Remove the Go proxy block transactionally.
+remove_go_apache() {
+    local vhost_file="$1" domain="$2"
+    local backup_dir="$3"
+    go_block_present "$vhost_file" "$domain" || return 0
+    add_changed_file "$backup_dir" "$vhost_file"
+    remove_go_block_from_vhost "$vhost_file" "$domain"
+    apache_configtest_or_restore "$backup_dir" "$vhost_file"
+    safe_reload_apache || true
+}
+
+# Idempotent: if a valid release is deployed, ensure the / proxy block
+# exists (repairs disable/enable cycles without requiring a redeploy).
+ensure_proxy_if_deployed() {
+    local domain="$1" registry="$2" backup_dir="$3"
+    # shellcheck source=/dev/null
+    source "$registry"
+    build_go_paths "$HOME"
+    local rid_now
+    rid_now="$(link_id "$CURRENT_LINK")"
+    if release_dir_ok "$rid_now" && [[ -n "${ENTRYPOINT:-}" && -x "$RELEASES_DIR/$rid_now/$ENTRYPOINT" ]]; then
+        if ! go_block_present "$APACHE_VHOST_FILE" "$domain"; then
+            apply_go_apache "$APACHE_VHOST_FILE" "$domain" "$PORT" "$backup_dir"
+        fi
+        sed -i "s|^APACHE_CONFIG_KIND='.*'|APACHE_CONFIG_KIND='proxy'|" "$registry"
+    fi
+}
+
+###############################################################################
+# enable — non-destructive: dirs, secrets file, metadata, port, registry.
+# No Apache proxy and no systemd unit until a valid release is deployed.
+###############################################################################
+cmd_enable() {
+    require_root
+    load_config
+
+    local domain="" json=0 want_port="" proxy_path="$GO_DEFAULT_PROXY_PATH"
+    local health_path="$GO_DEFAULT_HEALTH_PATH" ready_path="$GO_DEFAULT_READY_PATH"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --port) want_port="$2"; shift 2 ;;
+            --proxy-path) proxy_path="$2"; shift 2 ;;
+            --health-path) health_path="$2"; shift 2 ;;
+            --ready-path) ready_path="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+    [[ "$proxy_path" == "/" ]] || die "V1 supports only --proxy-path / (got: $proxy_path)"
+
+    get_domain_lock "$domain"
+    get_domain_info "$domain"
+    local dname="$RESOLVED_DOMAIN" duser="$RESOLVED_USER" dhome="$RESOLVED_HOME"
+
+    build_go_paths "$dhome"
+    assert_safe_app_root "$GO_APP_ROOT" "$dhome"
+
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+
+    local port="$want_port" version="" deploy_id="" entrypoint="" sha=""
+    local enabled=1 apache_kind="none" apache_vhost=""
+    if [[ -f "$registry" ]]; then
+        # Re-enable: keep port + release metadata, flip ENABLED=1.
+        # shellcheck source=/dev/null
+        source "$registry"
+        port="${PORT:-}"
+        version="${CURRENT_VERSION:-}"
+        deploy_id="${DEPLOY_ID:-}"
+        entrypoint="${ENTRYPOINT:-}"
+        sha="${DEPLOY_SHA256:-}"
+        proxy_path="${PROXY_PATH:-$proxy_path}"
+        health_path="${HEALTH_PATH:-$health_path}"
+        ready_path="${READY_PATH:-$ready_path}"
+        apache_kind="${APACHE_CONFIG_KIND:-none}"
+        apache_vhost="${APACHE_VHOST_FILE:-}"
+        [[ -n "$port" ]] || die "Existing registry for $domain has no port; remove it and enable fresh."
+    else
+        apache_vhost="$(find_apache_vhost_file "$domain")"
+        get_port_allocator_lock
+        port="$(alloc_go_port "$want_port")"
+        release_lock 9
+    fi
+
+    ensure_go_tree "$duser" "$duser"
+    ensure_prod_env "$duser" "$duser" "$port"
+    touch "${GO_APP_ROOT}/go.log" 2>/dev/null || true
+    chown "$duser:$duser" "${GO_APP_ROOT}/go.log" 2>/dev/null || true
+    write_meta_file "$duser" "$duser" "$port" "$proxy_path" "$version" "$health_path" "$deploy_id"
+    write_registry "$registry" "$domain" "$duser" "$duser" "$dhome" \
+        "$port" "$proxy_path" "$health_path" "$ready_path" \
+        "$version" "$deploy_id" "$entrypoint" "$sha" "$enabled" "$apache_kind" "$apache_vhost"
+
+    # Re-enable with an existing release restores the proxy (no redeploy).
+    if [[ -n "$entrypoint" ]]; then
+        local ebackup
+        ebackup="$(create_change_backup)"
+        add_changed_file "$ebackup" "$registry"
+        ensure_proxy_if_deployed "$domain" "$registry" "$ebackup"
+    fi
+
+    release_lock 9
+
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"domain":"'"$domain"'","app_root":"'"$GO_APP_ROOT"'","port":'"$port"',"state":"configured"}'
+    else
+        info "Go enabled for $domain (configured, no release yet)."
+        info "  App root: $GO_APP_ROOT"
+        info "  Port:     ${GO_LISTEN_HOST}:${port}"
+        info "  Next:     deploy an artifact, then the proxy + service are created."
+    fi
+}
+
+###############################################################################
+# disable — stop service + remove proxy, keep registry/data (ENABLED=0)
+###############################################################################
+cmd_disable() {
+    require_root
+    load_config
+
+    local domain="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+
+    get_domain_lock "$domain"
+
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+
+    local backup_dir
+    backup_dir="$(create_change_backup)"
+    add_changed_file "$backup_dir" "$registry"
+
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        systemctl stop "$SERVICE_NAME" || warn "Failed to stop $SERVICE_NAME"
+    fi
+    if [[ "${APACHE_CONFIG_KIND:-none}" != "none" ]]; then
+        remove_go_apache "$APACHE_VHOST_FILE" "$domain" "$backup_dir"
+    fi
+
+    sed -i "s/^ENABLED='.*'/ENABLED='0'/" "$registry"
+    sed -i "s/^APACHE_CONFIG_KIND='.*'/APACHE_CONFIG_KIND='none'/" "$registry"
+
+    release_lock 9
+
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"domain":"'"$domain"'","state":"disabled"}'
+    else
+        info "Go disabled for $domain (service stopped, proxy removed, data kept)."
+    fi
+}
+
+###############################################################################
+# start / stop / restart
+###############################################################################
+cmd_start() {
+    require_root
+    load_config
+    local domain="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    [[ -f "$SYSTEMD_UNIT" ]] || die "No systemd unit for $domain (no release deployed yet?)."
+    systemctl start "$SERVICE_NAME" || die "Failed to start $SERVICE_NAME"
+    # Starting with a valid release also restores the proxy if missing.
+    {
+        local sbackup
+        sbackup="$(create_change_backup)"
+        add_changed_file "$sbackup" "$registry"
+        ensure_proxy_if_deployed "$domain" "$registry" "$sbackup"
+    }
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"domain":"'"$domain"'","service":"'"$SERVICE_NAME"'","action":"start"}'
+    else
+        info "Started $SERVICE_NAME"
+    fi
+}
+
+cmd_stop() {
+    require_root
+    load_config
+    local domain="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        systemctl stop "$SERVICE_NAME" || die "Failed to stop $SERVICE_NAME"
+    fi
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"domain":"'"$domain"'","service":"'"$SERVICE_NAME"'","action":"stop"}'
+    else
+        info "Stopped $SERVICE_NAME"
+    fi
+}
+
+cmd_restart() {
+    require_root
+    load_config
+    local domain="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    [[ -f "$SYSTEMD_UNIT" ]] || die "No systemd unit for $domain (no release deployed yet?)."
+    systemctl restart "$SERVICE_NAME" || die "Failed to restart $SERVICE_NAME"
+    {
+        local sbackup
+        sbackup="$(create_change_backup)"
+        add_changed_file "$sbackup" "$registry"
+        ensure_proxy_if_deployed "$domain" "$registry" "$sbackup"
+    }
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"domain":"'"$domain"'","service":"'"$SERVICE_NAME"'","action":"restart"}'
+    else
+        info "Restarted $SERVICE_NAME"
+    fi
+}
+
+###############################################################################
+# remove — stop service, drop proxy/unit/registry. Data kept unless
+# --delete-data + explicit confirmation flag (guarded to $SERVER_HOME/apps/go).
+###############################################################################
+cmd_remove() {
+    require_root
+    load_config
+
+    local domain="" keep_data=1 delete_data=0 json=0 confirm=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --keep-data) keep_data=1; delete_data=0; shift ;;
+            --delete-data) delete_data=1; keep_data=0; shift ;;
+            --i-understand-this-deletes-go-data) confirm="yes"; shift ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+
+    get_domain_lock "$domain"
+
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+
+    local backup_dir
+    backup_dir="$(create_change_backup)"
+    add_changed_file "$backup_dir" "$registry"
+    add_changed_file "$backup_dir" "$SYSTEMD_UNIT"
+    add_changed_file "$backup_dir" "$APACHE_VHOST_FILE"
+
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        systemctl stop "$SERVICE_NAME" || warn "Failed to stop $SERVICE_NAME"
+    fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    fi
+    [[ -f "$SYSTEMD_UNIT" ]] && rm -f "$SYSTEMD_UNIT"
+    systemd_daemon_reload
+
+    if [[ "${APACHE_CONFIG_KIND:-none}" != "none" ]]; then
+        remove_go_apache "$APACHE_VHOST_FILE" "$domain" "$backup_dir"
+    else
+        # Belt-and-braces: drop a stray block if kind drifted.
+        if go_block_present "${APACHE_VHOST_FILE:-/nonexistent}" "$domain"; then
+            remove_go_apache "$APACHE_VHOST_FILE" "$domain" "$backup_dir"
+        fi
+    fi
+
+    local data_state="kept"
+    if [[ "$delete_data" == "1" ]]; then
+        [[ "$confirm" == "yes" ]] || \
+            die "Refusing to delete Go data without --i-understand-this-deletes-go-data"
+        assert_safe_app_root "$APP_ROOT" "$HOME"
+        # Never delete the containing server home — only apps/go itself.
+        [[ "$APP_ROOT" != "$HOME" ]] || die "Refusing: APP_ROOT equals server home."
+        if [[ -d "$APP_ROOT" ]]; then
+            rm -rf "$APP_ROOT"
+            data_state="deleted"
+            info "Data deleted: $APP_ROOT"
+        fi
+    fi
+
+    rm -f "$registry"
+
+    release_lock 9
+
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"domain":"'"$domain"'","data":"'"$data_state"'"}'
+    else
+        info "Go removed for $domain (service/unit/proxy/registry gone; data $data_state)."
+    fi
+}
+
+###############################################################################
+# Release artifacts: novel-api-0.1.0.tar.gz { manifest.json, bin/<app> }
+###############################################################################
+require_python3() {
+    command -v python3 &>/dev/null || die "python3 is required for manifest handling."
+}
+
+manifest_field() {
+    local manifest="$1" field="$2"
+    python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$manifest" "$field" 2>/dev/null
+}
+
+check_entrypoint_executable() {
+    local file="$1"
+    [[ -f "$file" && ! -L "$file" ]] || die "Entrypoint is not a regular file: $file"
+    [[ -x "$file" ]] || die "Entrypoint is not executable: $file (chmod +x before packaging)"
+    if command -v file &>/dev/null; then
+        local desc
+        desc="$(file -b "$file" 2>/dev/null || true)"
+        if [[ "$desc" == *ELF* ]]; then
+            [[ "$desc" == *x86-64* ]] || [[ "$desc" == *x86_64* ]] || \
+                die "Entrypoint is not a linux/amd64 binary: $desc"
+        elif head -c 2 "$file" | grep -q '#!'; then
+            : # script with shebang — allowed (test stubs, wrappers)
+        else
+            warn "Entrypoint is neither ELF nor shebang script: $desc"
+        fi
+    fi
+}
+
+sanitize_release_id() {
+    local raw="$1"
+    echo "$raw" | sed 's/[^A-Za-z0-9_.-]/_/g' | cut -c1-64
+}
+
+###############################################################################
+# deploy — upload artifact -> validate -> new releases/<id> -> health-gated
+# promotion. Never overwrites the running release. Auto-restores previous.
+###############################################################################
+cmd_deploy() {
+    require_root
+    load_config
+    require_python3
+
+    local domain="" artifact="" version_override="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --artifact) artifact="$2"; shift 2 ;;
+            --version) version_override="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    [[ -n "$domain" ]] || die "--domain is required"
+    [[ -n "$artifact" ]] || die "--artifact is required"
+    validate_domain_arg "$domain"
+    [[ -f "$artifact" ]] || die "Artifact not found: $artifact"
+    [[ "$artifact" == *.tar.gz || "$artifact" == *.tgz ]] || die "Artifact must be a .tar.gz"
+
+    get_domain_lock "$domain"
+
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry for $domain. Run enable first."
+    # shellcheck source=/dev/null
+    source "$registry"
+    build_go_paths "$HOME"
+    assert_safe_app_root "$APP_ROOT" "$HOME"
+    [[ "$APP_ROOT" == "$RELEASES_DIR"/.. ]] || true
+    # Registry paths must match live SERVER_HOME layout.
+    [[ "$APP_ROOT" == "${HOME}/${GO_APP_SUBDIR}" ]] || \
+        die "Registry APP_ROOT $APP_ROOT does not match server home $HOME."
+
+    get_domain_info "$domain"
+    local duser="$RESOLVED_USER"
+
+    local backup_dir
+    backup_dir="$(create_change_backup)"
+    add_changed_file "$backup_dir" "$registry"
+    [[ -f "$SYSTEMD_UNIT" ]] && add_changed_file "$backup_dir" "$SYSTEMD_UNIT"
+    add_changed_file "$backup_dir" "$APACHE_VHOST_FILE"
+
+    local sha
+    sha="$(sha256sum "$artifact" | awk '{print $1}')"
+    [[ -n "$sha" ]] || die "Could not hash artifact."
+
+    local stage
+    stage="$(mktemp -d)"
+    tar xzf "$artifact" -C "$stage" || { rm -rf "$stage"; die "Artifact extraction failed."; }
+    [[ -f "$stage/manifest.json" ]] || { rm -rf "$stage"; die "Artifact missing manifest.json at top level."; }
+
+    local m_name m_version m_arch m_entry m_health
+    m_name="$(manifest_field "$stage/manifest.json" "name")"
+    m_version="$(manifest_field "$stage/manifest.json" "version")"
+    m_arch="$(manifest_field "$stage/manifest.json" "architecture")"
+    m_entry="$(manifest_field "$stage/manifest.json" "entrypoint")"
+    m_health="$(manifest_field "$stage/manifest.json" "health_path")"
+    [[ -n "$version_override" ]] && m_version="$version_override"
+    [[ -z "$m_name" ]] && m_name="$domain"
+    [[ -n "$m_version" ]] || { rm -rf "$stage"; die "Manifest has no version (or pass --version)."; }
+    [[ "$m_version" =~ ^[A-Za-z0-9_.-]+$ ]] || { rm -rf "$stage"; die "Unsafe version string: $m_version"; }
+    [[ -n "$m_entry" ]] || { rm -rf "$stage"; die "Manifest has no entrypoint."; }
+    [[ "$m_entry" == *..* ]] && { rm -rf "$stage"; die "Unsafe entrypoint path: $m_entry"; }
+    if [[ -n "$m_arch" ]]; then
+        case "$m_arch" in
+            linux-amd64|linux/amd64|amd64) : ;;
+            *) rm -rf "$stage"; die "Unsupported architecture: $m_arch (need linux-amd64)" ;;
+        esac
+    else
+        warn "Manifest has no architecture field; assuming linux-amd64."
+    fi
+    [[ -n "$m_health" ]] || m_health="${HEALTH_PATH:-$GO_DEFAULT_HEALTH_PATH}"
+    [[ "$m_health" == /* ]] || { rm -rf "$stage"; die "health_path must start with /: $m_health"; }
+
+    [[ -f "$stage/$m_entry" ]] || { rm -rf "$stage"; die "Entrypoint missing in artifact: $m_entry"; }
+    check_entrypoint_executable "$stage/$m_entry"
+
+    local stamp rid dest
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    rid="$(sanitize_release_id "${m_version}-${stamp}")"
+    dest="${RELEASES_DIR}/${rid}"
+    [[ -e "$dest" ]] && { rm -rf "$stage"; die "Release collision: $rid (retry in a second)"; }
+
+    mkdir -p "$RELEASES_DIR"
+    mv "$stage" "$dest" || die "Could not stage release $rid."
+    chown -R "$duser:$duser" "$dest"
+    chmod 0750 "$dest"
+    cat > "$dest/deploy.json" << EOF
+{"domain":"$domain","version":"$m_version","sha256":"$sha","deployed_at":"$(date -Iseconds)","artifact":"$(basename "$artifact")"}
+EOF
+    chmod 0640 "$dest/deploy.json"
+    chown "$duser:$duser" "$dest/deploy.json"
+
+    # Rotate symlinks: previous <- old current id, current <- new release.
+    local old_id=""
+    if [[ -L "$CURRENT_LINK" ]]; then
+        old_id="$(link_id "$CURRENT_LINK")"
+        if release_dir_ok "$old_id"; then
+            set_link "$PREVIOUS_LINK" "$old_id" "$duser"
+        fi
+    fi
+    set_link "$CURRENT_LINK" "$rid" "$duser"
+
+    local entry_abs="${APP_ROOT}/current/${m_entry}"
+    write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" "$entry_abs" "$PORT"
+    ensure_prod_env "$duser" "$duser" "$PORT"
+
+    # Persist release metadata (secrets file untouched).
+    sed -i "s|^CURRENT_VERSION='.*'|CURRENT_VERSION='${m_version}'|" "$registry"
+    sed -i "s|^DEPLOY_ID='.*'|DEPLOY_ID='${rid}'|" "$registry"
+    sed -i "s|^ENTRYPOINT='.*'|ENTRYPOINT='${m_entry}'|" "$registry"
+    sed -i "s|^DEPLOY_SHA256='.*'|DEPLOY_SHA256='${sha}'|" "$registry"
+    sed -i "s|^HEALTH_PATH='.*'|HEALTH_PATH='${m_health}'|" "$registry"
+    sed -i "s|^ENABLED='.*'|ENABLED='1'|" "$registry"
+    write_meta_file "$duser" "$duser" "$PORT" "${PROXY_PATH:-/}" "$m_version" "$m_health" "$rid"
+
+    systemd_daemon_reload
+    systemctl enable "$SERVICE_NAME" 2>/dev/null || true
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        systemctl restart "$SERVICE_NAME" || warn "Restart signal sent with warnings."
+    else
+        systemctl start "$SERVICE_NAME" || warn "Start signal sent with warnings."
+    fi
+
+    if wait_for_health "$PORT" "$m_health"; then
+        apply_go_apache "$APACHE_VHOST_FILE" "$domain" "$PORT" "$backup_dir"
+        sed -i "s|^APACHE_CONFIG_KIND='.*'|APACHE_CONFIG_KIND='proxy'|" "$registry"
+        release_lock 9
+        if [[ "$json" == "1" ]]; then
+            echo '{"ok":true,"domain":"'"$domain"'","version":"'"$m_version"'","release":"'"$rid"'","port":'"$PORT"',"health":"ok"}'
+        else
+            info "Deployed $m_name $m_version ($rid) for $domain — health OK, proxy live."
+        fi
+        return 0
+    fi
+
+    # Health failed: restore previous release, restart, verify.
+    warn "Health check failed for $rid — restoring previous release."
+    if release_dir_ok "$old_id"; then
+        set_link "$CURRENT_LINK" "$old_id" "$duser"
+        local prev_entry prev_version
+        prev_entry="$(manifest_field "$RELEASES_DIR/$old_id/manifest.json" "entrypoint")"
+        prev_version="$(manifest_field "$RELEASES_DIR/$old_id/manifest.json" "version")"
+        [[ -n "$prev_entry" ]] || prev_entry="$m_entry"
+        [[ -n "$prev_version" ]] || prev_version=""
+        write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
+            "${APP_ROOT}/current/${prev_entry}" "$PORT"
+        systemd_daemon_reload
+        systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
+        sed -i "s|^CURRENT_VERSION='.*'|CURRENT_VERSION='${prev_version}'|" "$registry"
+        sed -i "s|^DEPLOY_ID='.*'|DEPLOY_ID='${old_id}'|" "$registry"
+        sed -i "s|^ENTRYPOINT='.*'|ENTRYPOINT='${prev_entry}'|" "$registry"
+        write_meta_file "$duser" "$duser" "$PORT" "${PROXY_PATH:-/}" "$prev_version" "$m_health" "$old_id"
+        rm -rf "${RELEASES_DIR:?}/${rid}"
+        release_lock 9
+        die "Deploy failed health check; previous release $old_id restored."
+    fi
+    # First deploy failed: leave no dangling symlink, no unit, no loop.
+    rm -rf "${RELEASES_DIR:?}/${rid}"
+    rm -f "$CURRENT_LINK"
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "$SYSTEMD_UNIT"
+    systemd_daemon_reload
+    release_lock 9
+    die "Deploy failed health check; no previous release to restore (release removed)."
+}
+
+###############################################################################
+# rollback — swap current/previous (reversible), never touches secrets.
+###############################################################################
+cmd_rollback() {
+    require_root
+    load_config
+    require_python3
+
+    local domain="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+
+    get_domain_lock "$domain"
+
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    build_go_paths "$HOME"
+    assert_safe_app_root "$APP_ROOT" "$HOME"
+
+    [[ -L "$CURRENT_LINK" && -L "$PREVIOUS_LINK" ]] || \
+        die "No previous release to roll back to (need current + previous)."
+    local cur prev
+    cur="$(link_id "$CURRENT_LINK")"
+    prev="$(link_id "$PREVIOUS_LINK")"
+    release_dir_ok "$prev" || die "Previous release missing: $prev"
+    [[ -f "$RELEASES_DIR/$prev/manifest.json" ]] || die "Previous release has no manifest: $prev"
+
+    get_domain_info "$domain"
+    local duser="$RESOLVED_USER"
+
+    local backup_dir
+    backup_dir="$(create_change_backup)"
+    add_changed_file "$backup_dir" "$registry"
+    add_changed_file "$backup_dir" "$SYSTEMD_UNIT"
+
+    local prev_entry prev_version
+    prev_entry="$(manifest_field "$RELEASES_DIR/$prev/manifest.json" "entrypoint")"
+    prev_version="$(manifest_field "$RELEASES_DIR/$prev/manifest.json" "version")"
+    [[ -n "$prev_entry" ]] || prev_entry="${ENTRYPOINT:-}"
+    [[ -x "$RELEASES_DIR/$prev/$prev_entry" ]] || die "Previous entrypoint not executable: $prev/$prev_entry"
+
+    set_link "$CURRENT_LINK" "$prev" "$duser"
+    set_link "$PREVIOUS_LINK" "$cur" "$duser"
+
+    if [[ "$prev_entry" != "${ENTRYPOINT:-}" ]]; then
+        write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
+            "${APP_ROOT}/current/${prev_entry}" "$PORT"
+        systemd_daemon_reload
+    fi
+    systemctl restart "$SERVICE_NAME" || warn "Restart signal sent with warnings."
+
+    if wait_for_health "$PORT" "${HEALTH_PATH:-/health}"; then
+        sed -i "s|^CURRENT_VERSION='.*'|CURRENT_VERSION='${prev_version}'|" "$registry"
+        sed -i "s|^DEPLOY_ID='.*'|DEPLOY_ID='${prev}'|" "$registry"
+        sed -i "s|^ENTRYPOINT='.*'|ENTRYPOINT='${prev_entry}'|" "$registry"
+        write_meta_file "$duser" "$duser" "$PORT" "${PROXY_PATH:-/}" "$prev_version" "${HEALTH_PATH:-/health}" "$prev"
+        release_lock 9
+        if [[ "$json" == "1" ]]; then
+            echo '{"ok":true,"domain":"'"$domain"'","version":"'"$prev_version"'","release":"'"$prev"'"}'
+        else
+            info "Rolled back $domain to $prev_version ($prev) — health OK."
+        fi
+        return 0
+    fi
+
+    warn "Rolled-back release unhealthy — swapping back to $cur."
+    set_link "$CURRENT_LINK" "$cur" "$duser"
+    set_link "$PREVIOUS_LINK" "$prev" "$duser"
+    if [[ "$prev_entry" != "${ENTRYPOINT:-}" ]]; then
+        write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
+            "${APP_ROOT}/current/${ENTRYPOINT}" "$PORT"
+        systemd_daemon_reload
+    fi
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || true
+    release_lock 9
+    die "Rollback target unhealthy; restored $cur."
+}
+
+###############################################################################
+# State model: disabled | configured | deployed | running | degraded
+###############################################################################
+compute_go_state() {
+    # Expects registry sourced. Echoes state.
+    if [[ "${ENABLED:-1}" == "0" ]]; then
+        echo "disabled"
+        return 0
+    fi
+    local svc_active=0
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && svc_active=1
+    local release_ok=0
+    if [[ -L "$CURRENT_LINK" ]]; then
+        local rid_now
+        rid_now="$(link_id "$CURRENT_LINK")"
+        if release_dir_ok "$rid_now" && [[ -n "${ENTRYPOINT:-}" && -x "$RELEASES_DIR/$rid_now/$ENTRYPOINT" ]]; then
+            release_ok=1
+        fi
+    fi
+    if [[ "$svc_active" == "1" ]]; then
+        if url_responds_ok "http://${LISTEN_HOST}:${PORT}${HEALTH_PATH:-/health}"; then
+            echo "running"
+        else
+            echo "degraded"
+        fi
+    else
+        if [[ "$release_ok" == "1" ]]; then
+            echo "deployed"
+        else
+            echo "configured"
+        fi
+    fi
+}
+
+cmd_status() {
+    load_config
+    local domain="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+
+    local svc="stopped"
+    systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && svc="running"
+    local port_ok="no"
+    ss -ltn 2>/dev/null | grep -q "127.0.0.1:${PORT}" && port_ok="yes"
+    local http_ok="no"
+    url_responds_ok "http://${LISTEN_HOST}:${PORT}${HEALTH_PATH:-/health}" && http_ok="yes"
+    local marker="n/a"
+    if [[ "${APACHE_CONFIG_KIND:-none}" != "none" ]]; then
+        marker="no"
+        go_block_present "$APACHE_VHOST_FILE" "$domain" && marker="yes"
+    fi
+    local state
+    state="$(compute_go_state)"
+
+    if [[ "$json" == "1" ]]; then
+        printf '{"domain":"%s","state":"%s","server_home":"%s","app_root":"%s","version":"%s","release":"%s","port":%s,"listen":"%s:%s","health":"%s","service":"%s","proxy":"%s"}\n' \
+            "$DOMAIN" "$state" "$HOME" "$APP_ROOT" "${CURRENT_VERSION:-}" "${DEPLOY_ID:-}" \
+            "$PORT" "$LISTEN_HOST" "$PORT" "$http_ok" "$svc" "$marker"
+    else
+        echo "Domain:      $DOMAIN"
+        echo "State:       $state"
+        echo "Server home: $HOME"
+        echo "App root:    $APP_ROOT"
+        echo "Version:     ${CURRENT_VERSION:-(none)} (${DEPLOY_ID:-(none)})"
+        echo "Listen:      ${LISTEN_HOST}:${PORT}"
+        echo "Service:     $SERVICE_NAME ($svc)"
+        echo "Port listening: $port_ok"
+        echo "Local health:   $http_ok (${HEALTH_PATH:-/health})"
+        echo "Apache proxy:   $marker"
+    fi
+}
+
+###############################################################################
+# validate — explicit PASS/WARN/FAIL, no secrets in output
+###############################################################################
+cmd_validate() {
+    load_config
+    local domain="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+
+    local failures=0 first=1
+    _vcheck() {
+        local status="$1" msg="$2"
+        if [[ "$json" == "1" ]]; then
+            [[ "$first" == "1" ]] && first=0 || printf ','
+            printf '{"status":"%s","check":"%s"}' "$status" "$msg"
+        else
+            printf "%-4s %s\n" "$status" "$msg"
+        fi
+        [[ "$status" == "FAIL" ]] && ((failures++)) || true
+    }
+    [[ "$json" == "1" ]] && printf '{"checks":['
+
+    if command -v virtualmin &>/dev/null; then
+        if virtualmin list-domains --domain "$domain" --name-only &>/dev/null; then
+            _vcheck "PASS" "Virtualmin server exists"
+        else
+            _vcheck "FAIL" "Virtualmin server missing"
+        fi
+    else
+        _vcheck "WARN" "Virtualmin CLI unavailable, skipping server check"
+    fi
+
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    if [[ -f "$registry" ]]; then
+        _vcheck "PASS" "Registry exists"
+        # shellcheck source=/dev/null
+        source "$registry"
+    else
+        _vcheck "FAIL" "Registry not found"
+        if [[ "$json" == "1" ]]; then printf '],"failures":%s}\n' "$failures"; else echo "Failures: $failures"; fi
+        return 1
+    fi
+
+    # SERVER_HOME correctness (live metadata vs registry)
+    {
+        local live_home
+        live_home="$(get_server_home_field "$domain" "Home directory")"
+        if [[ -n "$live_home" ]]; then
+            if [[ "$HOME" == "$live_home" && "$APP_ROOT" == "$live_home/$GO_APP_SUBDIR" ]]; then
+                _vcheck "PASS" "SERVER_HOME correct ($live_home)"
+            else
+                _vcheck "FAIL" "SERVER_HOME drift (registry HOME=$HOME, live=$live_home)"
+            fi
+        else
+            _vcheck "WARN" "Could not read live server home"
+        fi
+    }
+
+    # Owner/group
+    {
+        local live_user
+        live_user="$(get_server_home_field "$domain" "Username")"
+        if [[ -n "$live_user" ]]; then
+            if [[ "$USER" == "$live_user" ]]; then
+                _vcheck "PASS" "Owner correct ($USER)"
+            else
+                _vcheck "FAIL" "Owner drift (registry=$USER, live=$live_user)"
+            fi
+            local owner
+            owner="$(stat -c '%U:%G' "$APP_ROOT" 2>/dev/null || echo '?')"
+            if [[ "$owner" == "$USER:$USER" || "$owner" == "$USER:$GROUP" ]]; then
+                _vcheck "PASS" "App dir ownership correct ($owner)"
+            else
+                _vcheck "FAIL" "App dir ownership wrong ($owner, want $USER)"
+            fi
+        else
+            _vcheck "WARN" "Could not read live domain user"
+        fi
+    }
+
+    [[ -d "$APP_ROOT" ]] && _vcheck "PASS" "App directory exists" || _vcheck "FAIL" "App directory missing: $APP_ROOT"
+    if [[ -f "$META_FILE" ]]; then
+        if grep -q "^GO_PORT='${PORT}'" "$META_FILE" 2>/dev/null; then
+            _vcheck "PASS" "Metadata valid (port matches)"
+        else
+            _vcheck "WARN" "Metadata port drift"
+        fi
+        if grep -qE 'PASSWORD|SECRET|TOKEN|KEY=' "$META_FILE" 2>/dev/null; then
+            _vcheck "WARN" "Metadata file looks like it holds secrets (must stay in production.env)"
+        fi
+    else
+        _vcheck "FAIL" "Metadata file missing: $META_FILE"
+    fi
+    if [[ -f "$PROD_ENV" ]]; then
+        local mode
+        mode="$(stat -c '%a' "$PROD_ENV" 2>/dev/null || echo '?')"
+        [[ "$mode" == "600" ]] && _vcheck "PASS" "production.env present, 0600" || \
+            _vcheck "FAIL" "production.env mode $mode (want 600)"
+    else
+        _vcheck "FAIL" "production.env missing"
+    fi
+
+    # Release + symlinks + binary
+    local release_ok=0
+    if [[ -L "$CURRENT_LINK" ]]; then
+        local rid_now
+        rid_now="$(link_id "$CURRENT_LINK")"
+        if release_dir_ok "$rid_now"; then
+            _vcheck "PASS" "current symlink valid (-> releases/$rid_now)"
+            if [[ -n "${ENTRYPOINT:-}" && -x "$RELEASES_DIR/$rid_now/$ENTRYPOINT" ]]; then
+                _vcheck "PASS" "Binary executable ($ENTRYPOINT)"
+                release_ok=1
+            else
+                _vcheck "FAIL" "Binary missing/not executable: ${ENTRYPOINT:-(unset)}"
+            fi
+        else
+            _vcheck "FAIL" "current symlink broken (-> releases/${rid_now:-(none)})"
+        fi
+    else
+        _vcheck "WARN" "No current release (configured, not yet deployed)"
+    fi
+    if [[ -L "$PREVIOUS_LINK" ]]; then
+        local pid_now
+        pid_now="$(link_id "$PREVIOUS_LINK")"
+        release_dir_ok "$pid_now" && _vcheck "PASS" "previous release present (-> releases/$pid_now)" || \
+            _vcheck "WARN" "previous symlink broken"
+    else
+        _vcheck "WARN" "No previous release (rollback unavailable)"
+    fi
+
+    # systemd unit
+    if [[ -f "$SYSTEMD_UNIT" ]]; then
+        _vcheck "PASS" "systemd unit exists"
+        local svc_user svc_wd
+        svc_user="$(systemctl show "$SERVICE_NAME" --property=User --value 2>/dev/null || true)"
+        [[ "$svc_user" == "$USER" ]] && _vcheck "PASS" "Unit user correct" || \
+            _vcheck "FAIL" "Unit user mismatch (want $USER, got ${svc_user:-(none)})"
+        svc_wd="$(systemctl show "$SERVICE_NAME" --property=WorkingDirectory --value 2>/dev/null || true)"
+        [[ "$svc_wd" == "$APP_ROOT" ]] && _vcheck "PASS" "Unit WorkingDirectory correct" || \
+            _vcheck "FAIL" "Unit WorkingDirectory mismatch (got ${svc_wd:-(none)})"
+        grep -q "EnvironmentFile=${PROD_ENV}" "$SYSTEMD_UNIT" 2>/dev/null && \
+            _vcheck "PASS" "Unit uses production.env" || _vcheck "FAIL" "Unit missing EnvironmentFile"
+    else
+        if [[ "$release_ok" == "1" ]]; then _vcheck "FAIL" "systemd unit missing"; else _vcheck "WARN" "No unit yet (no release)"; fi
+    fi
+
+    # Port
+    if [[ "$PORT" -ge "$GO_BASE_PORT" ]] && [[ "$PORT" -le "$GO_MAX_PORT" ]]; then
+        _vcheck "PASS" "Port $PORT in Go range"
+    else
+        _vcheck "FAIL" "Port $PORT outside $GO_BASE_PORT-$GO_MAX_PORT"
+    fi
+    if grep -RH "^PORT='$PORT'" "$INSTANCES_DIR"/*.conf 2>/dev/null | grep -vq "$domain.conf"; then
+        _vcheck "FAIL" "Port $PORT claimed by another Go instance"
+    fi
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        if ss -ltn 2>/dev/null | grep -q "127.0.0.1:${PORT}"; then
+            _vcheck "PASS" "Port bound on 127.0.0.1:$PORT"
+        else
+            _vcheck "FAIL" "Service active but port not on 127.0.0.1:$PORT"
+        fi
+        # Bound ONLY on localhost (never 0.0.0.0)?
+        if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)${PORT}\$"; then
+            if ss -ltn 2>/dev/null | grep -E "0\.0\.0\.0:${PORT}|:::${PORT}" | grep -q .; then
+                _vcheck "FAIL" "Port $PORT exposed beyond localhost"
+            else
+                _vcheck "PASS" "Port bound to localhost only"
+            fi
+        fi
+        if url_responds_ok "http://${LISTEN_HOST}:${PORT}${HEALTH_PATH:-/health}"; then
+            _vcheck "PASS" "Local health endpoint succeeds"
+        else
+            _vcheck "FAIL" "Local health endpoint fails (${HEALTH_PATH:-/health})"
+        fi
+    else
+        _vcheck "WARN" "Service not active (state: $(compute_go_state))"
+    fi
+
+    # Apache
+    if apachectl configtest 2>/dev/null; then
+        _vcheck "PASS" "Apache config valid"
+    else
+        _vcheck "FAIL" "Apache configtest fails"
+    fi
+    if [[ "${APACHE_CONFIG_KIND:-none}" == "proxy" ]]; then
+        if go_block_present "$APACHE_VHOST_FILE" "$domain"; then
+            _vcheck "PASS" "Go proxy block present"
+            if grep -A20 "BEGIN VIRTUALMIN-GO ${domain}" "$APACHE_VHOST_FILE" 2>/dev/null | grep -q "127.0.0.1:${PORT}"; then
+                _vcheck "PASS" "Proxy points at expected port"
+            else
+                _vcheck "FAIL" "Proxy port mismatch (want $PORT)"
+            fi
+            # /pb/ (PocketBase) must sort before our / catch-all.
+            local pb_line go_line
+            pb_line="$(grep -n "ProxyPass /pb/" "$APACHE_VHOST_FILE" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+            go_line="$(grep -n "BEGIN VIRTUALMIN-GO ${domain}" "$APACHE_VHOST_FILE" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+            if [[ -n "$pb_line" && -n "$go_line" ]]; then
+                if [[ "$pb_line" -lt "$go_line" ]]; then
+                    _vcheck "PASS" "PocketBase /pb/ sorts before Go /"
+                else
+                    _vcheck "FAIL" "Go / block precedes PocketBase /pb/ (shadowing risk)"
+                fi
+            fi
+        else
+            _vcheck "FAIL" "Go proxy block missing"
+        fi
+        # External health where appropriate (best-effort, WARN only).
+        if command -v curl &>/dev/null; then
+            local code
+            code="$(http_status_code "https://${domain}${HEALTH_PATH:-/health}")"
+            case "$code" in
+                2*|3*) _vcheck "PASS" "External health endpoint succeeds (https)" ;;
+                *) _vcheck "WARN" "External health returned $code (proxy/DNS may still propagate)" ;;
+            esac
+        fi
+    else
+        _vcheck "WARN" "No Apache proxy (local-only/configured — expected before first deploy)"
+    fi
+
+    # PocketBase coexistence: our edits must not have removed /pb/.
+    if [[ -f "/etc/virtualmin-pocketbase/instances.d/${domain}.conf" ]]; then
+        if grep -q "BEGIN VIRTUALMIN-POCKETBASE ${domain}" "$APACHE_VHOST_FILE" 2>/dev/null; then
+            _vcheck "PASS" "PocketBase /pb/ block intact"
+        else
+            _vcheck "FAIL" "PocketBase block missing — Go must never remove it"
+        fi
+    fi
+
+    if [[ "$json" == "1" ]]; then
+        local ok="false"
+        [[ $failures -eq 0 ]] && ok="true"
+        printf '],"ok":%s,"failures":%s}\n' "$ok" "$failures"
+    else
+        echo
+        echo "Validation: $failures failures"
+    fi
+    [[ $failures -eq 0 ]] && return 0 || return 1
+}
+
+###############################################################################
+# logs / releases / prune-releases / list
+###############################################################################
+cmd_logs() {
+    load_config
+    local domain="" lines=100 json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --lines) lines="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    [[ "$lines" =~ ^[0-9]+$ ]] || lines=100
+    if [[ "$json" == "1" ]]; then
+        require_python3
+        local out
+        out="$(journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager 2>/dev/null || true)"
+        python3 -c "import json,sys; print(json.dumps({'domain':sys.argv[1],'service':sys.argv[2],'lines':sys.argv[3]}))" \
+            "$domain" "$SERVICE_NAME" "$out"
+    else
+        journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager 2>/dev/null || \
+            tail -n "$lines" "${APP_ROOT}/go.log" 2>/dev/null || echo "No logs available."
+    fi
+}
+
+cmd_releases() {
+    load_config
+    local domain="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    local cur prev
+    cur="$(link_id "$CURRENT_LINK")"
+    prev="$(link_id "$PREVIOUS_LINK")"
+    if [[ "$json" == "1" ]]; then
+        printf '{"domain":"%s","current":"%s","previous":"%s","releases":[' "$domain" "$cur" "$prev"
+        local first=1 d ver
+        for d in "$RELEASES_DIR"/*/; do
+            [[ -d "$d" ]] || continue
+            d="$(basename "$d")"
+            ver="$(manifest_field "$RELEASES_DIR/$d/manifest.json" "version" 2>/dev/null || true)"
+            [[ "$first" == "1" ]] && first=0 || printf ','
+            printf '{"id":"%s","version":"%s"}' "$d" "$ver"
+        done
+        printf ']}\n'
+    else
+        for d in "$RELEASES_DIR"/*/; do
+            [[ -d "$d" ]] || continue
+            d="$(basename "$d")"
+            local tags=""
+            [[ "$d" == "$cur" ]] && tags+=" current"
+            [[ "$d" == "$prev" ]] && tags+=" previous"
+            echo "$d$tags"
+        done
+    fi
+}
+
+cmd_prune_releases() {
+    require_root
+    load_config
+    local domain="" keep="$GO_KEEP_RELEASES" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --keep) keep="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    [[ "$keep" =~ ^[0-9]+$ && "$keep" -ge 2 ]] || die "--keep must be a number >= 2 (protects current+previous)"
+    get_domain_lock "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    local cur prev
+    cur="$(link_id "$CURRENT_LINK")"
+    prev="$(link_id "$PREVIOUS_LINK")"
+    local all=()
+    while IFS= read -r d; do [[ -n "$d" ]] && all+=("$d"); done < <(ls -1 "$RELEASES_DIR" 2>/dev/null | sort -r)
+    # Dedupe: current and previous often point at the same release.
+    local uniq_protected=()
+    local p q seen
+    for p in "$cur" "$prev"; do
+        [[ -n "$p" ]] || continue
+        seen=0
+        for q in ${uniq_protected[@]+"${uniq_protected[@]}"}; do [[ "$p" == "$q" ]] && seen=1; done
+        [[ "$seen" == "0" ]] && uniq_protected+=("$p")
+    done
+    local protected=("${uniq_protected[@]}")
+    local candidates=()
+    local d skip
+    for d in "${all[@]}"; do
+        skip=0
+        for p in "${protected[@]}"; do [[ "$d" == "$p" ]] && skip=1; done
+        [[ "$skip" == "0" ]] && candidates+=("$d")
+    done
+    local keep_extra=$(( keep - ${#protected[@]} ))
+    [[ "$keep_extra" -lt 0 ]] && keep_extra=0
+    local pruned=0 i=0
+    for d in "${candidates[@]}"; do
+        i=$((i+1))
+        if [[ "$i" -gt "$keep_extra" ]]; then
+            rm -rf "${RELEASES_DIR:?}/$d"
+            pruned=$((pruned+1))
+        fi
+    done
+    release_lock 9
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"domain":"'"$domain"'","pruned":'"$pruned"',"kept":'"$keep"'}'
+    else
+        info "Pruned $pruned release(s) for $domain (keeping newest $keep incl. current/previous)."
+    fi
+}
+
+cmd_list() {
+    load_config
+    local json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    if [[ "$json" == "1" ]]; then
+        printf '{"instances":['
+        local first=1 conf dom
+        for conf in "$INSTANCES_DIR"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            dom="$(basename "$conf" .conf)"
+            [[ "$first" == "1" ]] && first=0 || printf ','
+            printf '"%s"' "$dom"
+        done
+        printf ']}\n'
+    else
+        for conf in "$INSTANCES_DIR"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            basename "$conf" .conf
+        done
+    fi
+}
+
+###############################################################################
+# backup / restore — $APP_ROOT survives Virtualmin backup/restore cycles.
+# Excludes tmp/ (ephemeral). Secrets in production.env ARE included (root-only
+# artifact, same trust level as Virtualmin backups).
+###############################################################################
+cmd_backup() {
+    require_root
+    load_config
+    local domain="" dest="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --dest) dest="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" && -n "$dest" ]] || die "--domain and --dest are required"
+    validate_domain_arg "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry found for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    assert_safe_app_root "$APP_ROOT" "$HOME"
+    mkdir -p "$(dirname "$dest")"
+    cp -a "$registry" "${dest}.registry" 2>/dev/null || true
+    tar czf "$dest" --exclude='tmp/*' -C "$(dirname "$APP_ROOT")" "$(basename "$APP_ROOT")" \
+        || die "Backup failed."
+    chmod 0600 "$dest"
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"domain":"'"$domain"'","dest":"'"$dest"'"}'
+    else
+        info "Go backup for $domain -> $dest"
+    fi
+}
+
+cmd_restore() {
+    require_root
+    load_config
+    local domain="" src="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --source) src="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" && -n "$src" ]] || die "--domain and --source are required"
+    validate_domain_arg "$domain"
+    [[ -f "$src" ]] || die "Backup not found: $src"
+
+    get_domain_lock "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry for $domain. Run enable first, then restore."
+    # shellcheck source=/dev/null
+    source "$registry"
+    build_go_paths "$HOME"
+    assert_safe_app_root "$APP_ROOT" "$HOME"
+    get_domain_info "$domain"
+    local duser="$RESOLVED_USER"
+
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    local snap="${APP_ROOT}.restore-snap-$(date +%Y%m%d-%H%M%S)"
+    [[ -d "$APP_ROOT" ]] && mv "$APP_ROOT" "$snap"
+    mkdir -p "$APP_ROOT"
+    if tar xzf "$src" -C "$(dirname "$APP_ROOT")" 2>/dev/null; then
+        chown -R "$duser:$duser" "$APP_ROOT"
+        chmod 0750 "$APP_ROOT"
+        [[ -f "$PROD_ENV" ]] && chmod 0600 "$PROD_ENV"
+        systemctl start "$SERVICE_NAME" 2>/dev/null || true
+        if wait_for_health "$PORT" "${HEALTH_PATH:-/health}"; then
+            rm -rf "$snap"
+            release_lock 9
+            if [[ "$json" == "1" ]]; then echo '{"ok":true,"domain":"'"$domain"'","health":"ok"}';
+            else info "Restored $domain from $src — health OK."; fi
+            return 0
+        fi
+        warn "Restored tree unhealthy — rolling back to pre-restore snapshot."
+    else
+        warn "Extraction failed — rolling back to pre-restore snapshot."
+    fi
+    rm -rf "$APP_ROOT"
+    [[ -d "$snap" ]] && mv "$snap" "$APP_ROOT"
+    systemctl start "$SERVICE_NAME" 2>/dev/null || true
+    release_lock 9
+    die "Restore failed; previous tree put back."
+}
+
+cmd_version() {
+    echo "$SCRIPT_VERSION"
+}
+
+usage() {
+    cat << EOF
+virtualmin-go $SCRIPT_VERSION — versioned Go deployments per Virtualmin server
+
+Usage: $SCRIPT_NAME <command> [options]
+
+  enable    --domain D [--port P] [--proxy-path /] [--health-path H] [--ready-path R]
+  disable   --domain D
+  deploy    --domain D --artifact FILE.tar.gz [--version V]
+  rollback  --domain D
+  start     --domain D
+  stop      --domain D
+  restart   --domain D
+  status    --domain D [--json]
+  validate  --domain D [--json]
+  remove    --domain D [--keep-data|--delete-data --i-understand-this-deletes-go-data]
+  logs      --domain D [--lines N] [--json]
+  releases  --domain D [--json]
+  prune-releases --domain D [--keep N]
+  backup    --domain D --dest FILE.tar.gz
+  restore   --domain D --source FILE.tar.gz
+  list [--json]
+  version
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "$cmd" in
+        enable) cmd_enable "$@" ;;
+        disable) cmd_disable "$@" ;;
+        deploy) cmd_deploy "$@" ;;
+        rollback) cmd_rollback "$@" ;;
+        start|up) cmd_start "$@" ;;
+        stop|down) cmd_stop "$@" ;;
+        restart) cmd_restart "$@" ;;
+        status) cmd_status "$@" ;;
+        validate) cmd_validate "$@" ;;
+        remove|delete) cmd_remove "$@" ;;
+        logs) cmd_logs "$@" ;;
+        releases) cmd_releases "$@" ;;
+        prune-releases) cmd_prune_releases "$@" ;;
+        backup) cmd_backup "$@" ;;
+        restore) cmd_restore "$@" ;;
+        list) cmd_list "$@" ;;
+        version|--version|-V) cmd_version ;;
+        help|--help|-h|"") usage ;;
+        *) die "Unknown command: $cmd (try '$SCRIPT_NAME help')" ;;
+    esac
+}
+
+main "$@"
