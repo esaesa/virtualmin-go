@@ -1,6 +1,19 @@
 # Changelog — virtualmin-go
 
-## 0.1.0 (2026-09-21)
+## 0.1.1 (2026-09-21)
+
+- Ownership contract (AGENTS.md/README.md): module owns only its marker
+  blocks, registries, units, and `apps/go/**`. Vhost structure, `:80`,
+  redirects, SSL stay Virtualmin-owned. Reverted a manual `:80` redirect on
+  `api.novel-co.com`, replaced with Virtualmin's native `create-redirect`
+  (the mechanism PocketBase relies on).
+- `validate`: new WARN when the `/` proxy is live but no native http→https
+  redirect exists (detection only, with the native fix command).
+- sysinfo dashboard parity with PocketBase: per-instance table now shows
+  Domain, Version, Port, and live State (registry-first, cheap systemd
+  check only — same rendering practice as the reference).
+- `install.sh` grants the module in `/etc/webmin/webmin.acl` next to
+  `virtualmin-pocketbase` (fixes "Access denied" for root on first install).
 
 - Initial sibling module of `virtualmin-pocketbase` (G1–G10 scope).
 - Canonical `SERVER_HOME` resolution from Virtualmin metadata;

@@ -14,14 +14,14 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 # virtualmin-go — Root CLI manager for Go application instances
-# Version: 0.1.0
+# Version: 0.1.1
 set -euo pipefail
 
 ###############################################################################
 # Globals
 ###############################################################################
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="0.1.0"
+readonly SCRIPT_VERSION="0.1.1"
 readonly LOCK_DIR="/tmp/virtualmin-go/locks"
 readonly INSTANCES_DIR="/etc/virtualmin-go/instances.d"
 readonly CONFIG_FILE="/etc/virtualmin-go/config"
@@ -1549,6 +1549,17 @@ cmd_validate() {
         fi
     else
         _vcheck "WARN" "No Apache proxy (local-only/configured — expected before first deploy)"
+    fi
+
+    # Scheme upgrade is Virtualmin-owned space (module must never hand-edit
+    # :80 or redirects — see ownership contract). Detect the gap, don't fix.
+    # Only relevant once the / proxy is live.
+    if [[ "${APACHE_CONFIG_KIND:-none}" == "proxy" ]] && command -v virtualmin &>/dev/null; then
+        if virtualmin list-redirects --domain "$domain" 2>/dev/null | grep -q 'https://%{HTTP_HOST}'; then
+            _vcheck "PASS" "Native http→https redirect present (Virtualmin-owned)"
+        else
+            _vcheck "WARN" "No http→https redirect (fix: virtualmin create-redirect --domain $domain --path '^/(?!.well-known)' --redirect 'https://%{HTTP_HOST}/\$1' --regexp --http)"
+        fi
     fi
 
     # PocketBase coexistence: our edits must not have removed /pb/.

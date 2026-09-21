@@ -71,6 +71,15 @@ else
     grep "^plugins=" "$VSCONF"
 fi
 
+echo "Granting module to Webmin users holding virtualmin-pocketbase..."
+for acl in /etc/webmin/webmin.acl; do
+    if [[ -f "$acl" ]] && grep -q "virtualmin-pocketbase" "$acl" && ! grep -q "virtualmin-go" "$acl"; then
+        cp -a "$acl" "${acl}.bak-virtualmin-go-$(date +%F-%H%M%S)"
+        sed -i 's/ virtualmin-pocketbase / virtualmin-pocketbase virtualmin-go /;s/ virtualmin-pocketbase$/ virtualmin-pocketbase virtualmin-go/' "$acl"
+        echo "Granted in $acl"
+    fi
+done
+
 bash -n /usr/local/sbin/virtualmin-go && echo "CLI syntax OK"
 for pl in virtual_feature.pl virtualmin-go-lib.pl; do
     perl -I"$WEBMIN_ROOT" -c "$DEST/$pl" || { echo "ERROR: $pl failed compile check"; exit 1; }

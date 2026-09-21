@@ -29,7 +29,21 @@ perl -I/usr/share/webmin -c "$WEBMIN/virtualmin-go-lib.pl"
 systemctl restart webmin
 ```
 
-### Safety rules (never violate)
+### Ownership contract (never violate)
+
+The module owns ONLY these, and changes them only through module code:
+- `$SERVER_HOME/apps/go/**` (via CLI, guarded by `assert_safe_app_root`)
+- `/etc/virtualmin-go/instances.d/*.conf` (registries)
+- `/etc/systemd/system/virtualmin-go-*.service` (units)
+- Lines between `BEGIN/END VIRTUALMIN-GO <domain>` inside the `:443` vhost
+
+Everything else is Virtualmin-owned: vhost structure, `:80` content,
+scheme/host redirects, SSL directives, `/.well-known`, webmail/admin rules.
+The module MUST NOT hand-edit those — not even "one small rule" (2026-09-21
+lesson: a manual `:80` redirect was reverted and replaced with Virtualmin's
+native `create-redirect`, the same mechanism PocketBase relies on).
+Missing Virtualmin-side configuration is reported as a `validate` WARN with
+the native fix command, never silently patched.
 
 - Never derive paths from `/home/<user>` or domain dots. Always
   `get_server_home_field` → `resolve_domain` → `GO_APP_ROOT=$SERVER_HOME/apps/go`.

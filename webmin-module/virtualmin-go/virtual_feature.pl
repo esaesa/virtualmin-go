@@ -230,12 +230,29 @@ if (-d $instances_dir) {
 	}
 my $count = scalar(@instances);
 my $s = $count != 1 ? 's' : '';
-my $html = "<p><b>$count</b> Go application$s configured.</p>\n";
+my $html = "<p><b>$count</b> Go application$s configured. Ports 18100-18199.</p>\n";
 if ($count > 0) {
 	$html .= "<table class='ui_table'>\n";
+	$html .= "<tr><th>Domain</th><th>Version</th><th>Port</th><th>State</th></tr>\n";
 	for my $dom (@instances) {
+		my $inst = &vgo_load_instance($dom);
+		my $ver = ($inst && $inst->{'CURRENT_VERSION'}) ? $inst->{'CURRENT_VERSION'} : '(none)';
+		my $port = ($inst && $inst->{'PORT'}) ? $inst->{'PORT'} : '';
+		# Live state only: cheap local systemd check, no HTTP, no CLI spawn
+		# (mirrors PocketBase dashboard practice of registry-first rendering).
+		my $state = 'configured';
+		if ($inst && $inst->{'SERVICE_NAME'}) {
+			my $svc = $inst->{'SERVICE_NAME'};
+			$svc =~ s/[^A-Za-z0-9_@.:-]/_/g;
+			$state = (system("systemctl is-active --quiet ".quotemeta($svc)." 2>/dev/null") == 0)
+				? 'running' : ($inst->{'ENTRYPOINT'} ? 'deployed' : 'configured');
+			$state = 'disabled' if ($inst->{'ENABLED'} || '1') eq '0';
+			}
 		$html .= "<tr><td><a href='virtualmin-go/status.cgi?domain=".
-			  &urlize($dom)."'>".&html_escape($dom)."</a></td></tr>\n";
+			  &urlize($dom)."'>".&html_escape($dom)."</a></td>".
+			  "<td>".&html_escape($ver)."</td>".
+			  "<td>".&html_escape($port)."</td>".
+			  "<td>$state</td></tr>\n";
 		}
 	$html .= "</table>\n";
 	}

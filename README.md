@@ -46,6 +46,14 @@ tests/                              # syntax + lifecycle tests
 docs/                               # milestone notes
 ```
 
+## Ownership boundary (shared with virtualmin-pocketbase)
+
+The module owns only: `apps/go/**`, its registries, its systemd units, and
+the lines between `BEGIN/END VIRTUALMIN-GO <domain>` in the `:443` vhost.
+Vhost structure, `:80` content, scheme/host redirects, and SSL directives are
+Virtualmin-owned — the module detects gaps (e.g. missing http→https redirect)
+as `validate` WARNs with the native fix, never hand-edits them.
+
 ## CLI lifecycle
 
 ```text
