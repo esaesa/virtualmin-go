@@ -33,3 +33,10 @@
 - `status --json` (5-state model, no secrets) and `validate` PASS/WARN/FAIL.
 - `backup`/`restore` of `$APP_ROOT` (excludes `tmp/`), `prune-releases`
   (default keep 5, never current/previous), guarded `remove`.
+
+## 0.1.2 (2026-09-21)
+
+- Global Settings page (`edit_config.cgi`) parity with PocketBase: validated
+  atomic update of `/etc/virtualmin-go/config` with backup + audit trail.
+  Guardrails: loopback-only listener, no overlap with PB 18000–18999,
+  retention >= 2. Never touches instance secrets.

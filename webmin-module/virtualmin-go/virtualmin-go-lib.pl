@@ -56,7 +56,7 @@ our $CLI = $config{'cli'} || '/usr/local/sbin/virtualmin-go';
 our $CONFIG_FILE = $ENV{'VGO_CONFIG_FILE'} || '/etc/virtualmin-go/config';
 our $INSTANCES_DIR = $ENV{'VGO_INSTANCES_DIR'} || '/etc/virtualmin-go/instances.d';
 
-sub vgo_version { return '0.1.1'; }
+sub vgo_version { return '0.1.2'; }
 sub vgo_now_iso { return strftime('%Y-%m-%dT%H:%M:%S%z', localtime()); }
 sub vgo_stamp { return strftime('%Y%m%d-%H%M%S', localtime()); }
 
