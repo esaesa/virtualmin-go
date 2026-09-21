@@ -32,4 +32,5 @@ else {
     print "<p>No Go instances yet. Enable the Go feature on a Virtualmin server, then deploy an artifact.</p>\n";
 }
 
+print "<p><a href='edit_config.cgi'>Global settings</a></p>\n";
 &ui_print_footer('/', 'Webmin');

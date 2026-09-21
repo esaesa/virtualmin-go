@@ -29,3 +29,6 @@ feat_clash=Go is already configured for this domain
 
 # Status
 theme_title=Go Applications
+
+# Global settings page
+settings_title=Go Global Settings

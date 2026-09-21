@@ -222,6 +222,22 @@ sub vgo_app_dir
     return "$inst->{'HOME'}/apps/go";
 }
 
+sub vgo_global_config
+{
+    my %cfg;
+    return \%cfg if !-f $CONFIG_FILE;
+    open(my $fh, '<', $CONFIG_FILE) || return \%cfg;
+    while (my $line = <$fh>) {
+        chomp($line);
+        next if $line =~ /^\s*(?:#|$)/;
+        if ($line =~ /^([A-Z][A-Z0-9_]*)=(.*)$/) {
+            $cfg{$1} = vgo_decode_registry_value($2);
+        }
+    }
+    close($fh);
+    return \%cfg;
+}
+
 sub vgo_command_rules
 {
     return {

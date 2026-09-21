@@ -13,7 +13,7 @@ for pl in virtual_feature.pl virtualmin-go-lib.pl; do
         echo "FAIL: perl -c $pl"; fail=1
     fi
 done
-for cgi in index.cgi status.cgi validate.cgi action.cgi; do
+for cgi in index.cgi status.cgi validate.cgi action.cgi edit_config.cgi; do
     if perl -I"$WEBMIN_ROOT" -c "$ROOT/webmin-module/virtualmin-go/$cgi" 2>&1 | grep -q "syntax OK"; then
         echo "PASS: perl -c $cgi"
     else

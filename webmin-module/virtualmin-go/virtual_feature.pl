@@ -324,4 +324,13 @@ sub feature_backup_name
 return $text{'feat_backup_name'};
 }
 
+# ── Settings link ────────────────────────────────────────────────────
+
+sub settings_links
+{
+return ( { 'link' => "/$module_name/edit_config.cgi",
+	   'title' => $text{'settings_title'},
+	   'cat' => 'setting' } );
+}
+
 1;
