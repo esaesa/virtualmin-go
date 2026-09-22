@@ -44,6 +44,16 @@ GO_DEFAULT_LIMIT_NOFILE=65535
 GO_RESTART_POLICY="on-failure"
 GO_RESTART_SEC=2
 GO_APACHE_TIMEOUT=60
+GO_ALLOW_ONLINE_TOOLCHAIN_DOWNLOAD=0
+GO_BUILD_TIMEOUT=600
+GO_DEFAULT_MODE="prod"
+GO_DEV_HEALTH_RETRIES=45
+
+# Shared Go toolchain store (compilers are shared tooling like the
+# PocketBase runtime — application binaries stay in $SERVER_HOME/apps/go).
+readonly TOOLCHAINS_BASE="/opt/virtualmin-go/toolchains"
+readonly CURRENT_TC_LINK="/opt/virtualmin-go/toolchains/current"
+readonly GO_DL_FEED="https://go.dev/dl/?mode=json"
 
 ###############################################################################
 # Helpers
@@ -183,6 +193,7 @@ get_port_allocator_lock() {
 
 get_domain_lock() {
     local domain="$1"
+    [[ "${VGO_SKIP_DOMAIN_LOCK:-0}" == "1" ]] && return 0
     acquire_lock "domain-${domain}"
 }
 
@@ -209,6 +220,31 @@ set_link() {
 release_dir_ok() {
     local id="$1"
     [[ -n "$id" && -d "$RELEASES_DIR/$id" ]]
+}
+
+deploy_field() {
+    local dir="$1" field="$2"
+    [[ -f "$dir/deploy.json" ]] || { printf ''; return 0; }
+    python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$dir/deploy.json" "$field" 2>/dev/null || printf ''
+}
+
+# Mode-aware entry check: prod needs executable bin/, dev needs src/ tree.
+release_entry_ok() {
+    local id="$1" entry="$2" mode="${3:-prod}"
+    if [[ "$mode" == "dev" ]]; then
+        [[ -d "$RELEASES_DIR/$id/src" ]]
+    else
+        [[ -n "$entry" && -x "$RELEASES_DIR/$id/$entry" ]]
+    fi
+}
+
+# Pre-T2 registries lack newer fields; append before sed updates.
+heal_registry_fields() {
+    local registry="$1"
+    for key in GO_TOOLCHAIN SOURCE_URL SOURCE_BRANCH SOURCE_COMMIT GO_MODE; do
+        grep -q "^${key}=" "$registry" || echo "${key}=''" >> "$registry"
+    done
+    grep -q "^GO_MODE='.\+'" "$registry" || sed -i "s|^GO_MODE=''|GO_MODE='prod'|" "$registry"
 }
 
 ###############################################################################
@@ -284,6 +320,8 @@ write_registry() {
     local port="$6" proxy_path="$7" health_path="$8" ready_path="$9"
     local version="${10}" deploy_id="${11}" entrypoint="${12}" sha="${13}"
     local enabled="${14}" apache_kind="${15}" apache_vhost="${16}"
+    local toolchain="${17:-}"
+    local src_url="${18:-}" src_branch="${19:-}" src_commit="${20:-}" go_mode="${21:-prod}"
     local unit="virtualmin-go-${domain}.service"
     cat > "$registry" << EOF
 DOMAIN='${domain}'
@@ -311,6 +349,11 @@ CURRENT_VERSION='${version}'
 DEPLOY_ID='${deploy_id}'
 ENTRYPOINT='${entrypoint}'
 DEPLOY_SHA256='${sha}'
+GO_TOOLCHAIN='${toolchain}'
+SOURCE_URL='${src_url}'
+SOURCE_BRANCH='${src_branch}'
+SOURCE_COMMIT='${src_commit}'
+GO_MODE='${go_mode}'
 ENABLED='${enabled}'
 APACHE_VHOST_FILE='${apache_vhost}'
 APACHE_CONFIG_KIND='${apache_kind}'
@@ -365,22 +408,34 @@ alloc_go_port() {
 ###############################################################################
 write_go_systemd_unit() {
     local unit_file="$1" domain="$2" user="$3" group="$4"
-    local entrypoint_abs="$5" port="$6"
+    local entrypoint_abs="$5" port="$6" mode="${7:-prod}" tc_bin="${8:-}"
+    local workdir="${GO_APP_ROOT}"
+    local exec_start="${entrypoint_abs}"
+    local extra_env=""
+    if [[ "$mode" == "dev" ]]; then
+        # Dev: run from the release source tree with the pinned toolchain.
+        workdir="${GO_APP_ROOT}/current/src"
+        exec_start="${tc_bin} run ${VGO_DEV_PACKAGE:-.}"
+        extra_env="Environment=GOCACHE=${GO_APP_ROOT}/tmp/gocache
+Environment=GOMODCACHE=${GO_APP_ROOT}/tmp/gomodcache
+Environment=GOTOOLCHAIN=local
+"
+    fi
     local nofile="${GO_DEFAULT_LIMIT_NOFILE:-65535}"
     cat > "$unit_file" << UNITEOF
 [Unit]
-Description=Go application for ${domain} (virtualmin-go)
+Description=Go application for ${domain} (virtualmin-go, ${mode})
 After=network.target
 
 [Service]
 Type=simple
 User=${user}
 Group=${group}
-WorkingDirectory=${GO_APP_ROOT}
+WorkingDirectory=${workdir}
 EnvironmentFile=${GO_PROD_ENV}
 Environment=GO_ADDR=${GO_LISTEN_HOST}:${port}
 Environment=GO_PORT=${port}
-ExecStart=${entrypoint_abs}
+${extra_env}ExecStart=${exec_start}
 Restart=${GO_RESTART_POLICY:-on-failure}
 RestartSec=${GO_RESTART_SEC:-2}
 LimitNOFILE=${nofile}
@@ -439,6 +494,49 @@ wait_for_health() {
             2*|3*) return 0 ;;
         esac
         sleep 1
+    done
+    return 1
+}
+
+wait_for_port_free() {
+    local port="$1" retries="${2:-10}" i
+    for (( i=1; i<=retries; i++ )); do
+        ss -ltn 2>/dev/null | grep -q "127.0.0.1:${port}" || return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Combined gate: listener must belong to the unit (or its children) AND the
+# health endpoint must succeed. Loops because `go run` compiles on start.
+wait_for_unit_health() {
+    local service="$1" port="$2" health_path="$3" retries="${4:-${GO_HEALTH_RETRIES:-10}}"
+    local i code
+    for (( i=1; i<=retries; i++ )); do
+        if verify_unit_listening "$service" "$port"; then
+            code="$(http_status_code "http://${GO_LISTEN_HOST}:${port}${health_path}")"
+            case "$code" in
+                2*|3*) return 0 ;;
+            esac
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# Listener must belong to the unit's MainPID or its children
+# (`go run` supervises the listening child).
+verify_unit_listening() {
+    local service="$1" port="$2"
+    local main
+    main="$(systemctl show "$service" --property=MainPID --value 2>/dev/null || true)"
+    [[ -n "$main" && "$main" != "0" ]] || return 1
+    local pids="$main $(ps -o pid= --ppid "$main" 2>/dev/null | tr '\n' ' ')"
+    local lp
+    lp="$(ss -ltnp 2>/dev/null | grep "127.0.0.1:${port}" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)"
+    [[ -n "$lp" ]] || return 1
+    for p in $pids; do
+        [[ "$lp" == "$p" ]] && return 0
     done
     return 1
 }
@@ -644,6 +742,7 @@ cmd_enable() {
 
     local domain="" json=0 want_port="" proxy_path="$GO_DEFAULT_PROXY_PATH"
     local health_path="$GO_DEFAULT_HEALTH_PATH" ready_path="$GO_DEFAULT_READY_PATH"
+    local want_toolchain=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domain) domain="$2"; shift 2 ;;
@@ -651,6 +750,7 @@ cmd_enable() {
             --proxy-path) proxy_path="$2"; shift 2 ;;
             --health-path) health_path="$2"; shift 2 ;;
             --ready-path) ready_path="$2"; shift 2 ;;
+            --toolchain) want_toolchain="$2"; shift 2 ;;
             --json) json=1; shift ;;
             *) shift ;;
         esac
@@ -670,7 +770,8 @@ cmd_enable() {
     local registry="${INSTANCES_DIR}/${domain}.conf"
 
     local port="$want_port" version="" deploy_id="" entrypoint="" sha=""
-    local enabled=1 apache_kind="none" apache_vhost=""
+    local enabled=1 apache_kind="none" apache_vhost="" toolchain=""
+    local src_url="" src_branch="" src_commit="" go_mode="prod"
     if [[ -f "$registry" ]]; then
         # Re-enable: keep port + release metadata, flip ENABLED=1.
         # shellcheck source=/dev/null
@@ -679,12 +780,17 @@ cmd_enable() {
         version="${CURRENT_VERSION:-}"
         deploy_id="${DEPLOY_ID:-}"
         entrypoint="${ENTRYPOINT:-}"
+        toolchain="${GO_TOOLCHAIN:-}"
         sha="${DEPLOY_SHA256:-}"
         proxy_path="${PROXY_PATH:-$proxy_path}"
         health_path="${HEALTH_PATH:-$health_path}"
         ready_path="${READY_PATH:-$ready_path}"
         apache_kind="${APACHE_CONFIG_KIND:-none}"
         apache_vhost="${APACHE_VHOST_FILE:-}"
+        src_url="${SOURCE_URL:-}"
+        src_branch="${SOURCE_BRANCH:-}"
+        src_commit="${SOURCE_COMMIT:-}"
+        go_mode="${GO_MODE:-prod}"
         [[ -n "$port" ]] || die "Existing registry for $domain has no port; remove it and enable fresh."
     else
         apache_vhost="$(find_apache_vhost_file "$domain")"
@@ -698,9 +804,14 @@ cmd_enable() {
     touch "${GO_APP_ROOT}/go.log" 2>/dev/null || true
     chown "$duser:$duser" "${GO_APP_ROOT}/go.log" 2>/dev/null || true
     write_meta_file "$duser" "$duser" "$port" "$proxy_path" "$version" "$health_path" "$deploy_id"
+    if [[ -n "$want_toolchain" ]]; then
+        toolchain="$(tc_canonical "$want_toolchain")"
+        [[ -x "$(tc_dir_for "$toolchain")/bin/go" ]] || die "Go toolchain $toolchain is not installed."
+    fi
     write_registry "$registry" "$domain" "$duser" "$duser" "$dhome" \
         "$port" "$proxy_path" "$health_path" "$ready_path" \
-        "$version" "$deploy_id" "$entrypoint" "$sha" "$enabled" "$apache_kind" "$apache_vhost"
+        "$version" "$deploy_id" "$entrypoint" "$sha" "$enabled" "$apache_kind" "$apache_vhost" \
+        "$toolchain" "$src_url" "$src_branch" "$src_commit" "$go_mode"
 
     # Re-enable with an existing release restores the proxy (no redeploy).
     if [[ -n "$entrypoint" ]]; then
@@ -984,23 +1095,187 @@ sanitize_release_id() {
 # deploy — upload artifact -> validate -> new releases/<id> -> health-gated
 # promotion. Never overwrites the running release. Auto-restores previous.
 ###############################################################################
+###############################################################################
+# T2 — Build from source (git or local dir) with a pinned toolchain.
+# Output: a staging dir shaped exactly like an artifact (manifest.json +
+# bin/ for prod, manifest.json + src/ for dev) for the atomic deploy flow.
+###############################################################################
+valid_source_url() {
+    [[ "${1:-}" =~ ^(https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+|git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+)$ ]]
+}
+
+go_build_release() {
+    # args: user tc_ver src_dir app_name package build_flags mode stage_out
+    local user="$1" tc_ver="$2" src="$3" app="$4" pkg="$5" bflags="$6" mode="$7" stage="$8"
+    local go_bin
+    go_bin="$(tc_dir_for "$tc_ver")/bin/go"
+    [[ -x "$go_bin" ]] || die "Go toolchain $tc_ver not installed."
+    [[ "$app" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Unsafe app name: $app"
+    mkdir -p "$stage/bin" "$stage/src"
+    cp -a "$src/." "$stage/src/"
+    chown -R "$user:$user" "$stage"
+    local cache="$GO_APP_ROOT/tmp/gocache" modcache="$GO_APP_ROOT/tmp/gomodcache"
+    mkdir -p "$cache" "$modcache"
+    chown -R "$user:$user" "$cache" "$modcache"
+    chmod 0750 "$cache" "$modcache"
+    if [[ "$mode" == "prod" ]]; then
+        # shellcheck disable=SC2086
+        timeout "${GO_BUILD_TIMEOUT:-600}" runuser -u "$user" -- env -i \
+            HOME="$(getent passwd "$user" | cut -d: -f6)" \
+            PATH="/usr/bin:/bin" \
+            GOCACHE="$cache" GOMODCACHE="$modcache" GOPATH="$GO_APP_ROOT/tmp/gopath" \
+            GOTOOLCHAIN=local GOFLAGS="-buildvcs=false" CGO_ENABLED=0 \
+            VGO_SRC="$stage/src" VGO_BIN="$go_bin" VGO_OUT="$stage/bin/$app" \
+            VGO_PKG="$pkg" VGO_FLAGS="$bflags" \
+            sh -c 'cd "$VGO_SRC" && exec "$VGO_BIN" build $VGO_FLAGS -o "$VGO_OUT" "$VGO_PKG"' \
+            || die "go build failed (see output above)."
+        chmod 0750 "$stage/bin/$app"
+        chown "$user:$user" "$stage/bin/$app"
+    fi
+}
+
+deploy_from_source() {
+    # Re-parses the original deploy argv (source branch). Builds a release
+    # tarball, then runs the identical artifact flow via recursion.
+    local domain="" version_override="" json=0
+    local src_url="" src_branch="" src_commit="" src_dir="" pkg="./..." bflags=""
+    local app_name="" go_mode="prod" artifact=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --version) version_override="$2"; shift 2 ;;
+            --source) src_url="$2"; shift 2 ;;
+            --branch) src_branch="$2"; shift 2 ;;
+            --commit) src_commit="$2"; shift 2 ;;
+            --source-dir) src_dir="$2"; shift 2 ;;
+            --package) pkg="$2"; shift 2 ;;
+            --build-flags) bflags="$2"; shift 2 ;;
+            --app-name) app_name="$2"; shift 2 ;;
+            --mode) go_mode="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$app_name" ]] && [[ "$app_name" =~ ^[A-Za-z0-9_.-]+$ ]] || \
+        app_name="$(basename "$domain" | cut -d. -f1)"
+    get_domain_lock "$domain"
+    get_domain_info "$domain"
+    local duser="$RESOLVED_USER" dhome="$RESOLVED_HOME"
+    build_go_paths "$dhome"
+    assert_safe_app_root "$GO_APP_ROOT" "$dhome"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry for $domain. Run enable first."
+    # shellcheck source=/dev/null
+    source "$registry"
+    local tc_ver
+    tc_ver="$(resolve_tc_for_domain "${GO_TOOLCHAIN:-}")"
+
+    local work
+    work="$(mktemp -d)"
+    chmod 0755 "$work"
+    chown "$duser:$duser" "$work"
+    local src="$work/src"
+    local commit="local"
+    if [[ -n "$src_url" ]]; then
+        timeout 300 runuser -u "$duser" -- git clone --depth 1 \
+            ${src_branch:+--branch "$src_branch"} "$src_url" "$src" 2>&1 | tail -2 || \
+            { rm -rf "$work"; die "git clone failed."; }
+        if [[ -n "$src_commit" ]]; then
+            [[ "$src_commit" =~ ^[0-9a-f]{7,40}$ ]] || { rm -rf "$work"; die "Unsafe --commit value."; }
+            runuser -u "$duser" -- git -C "$src" fetch --depth 1 origin "$src_commit" 2>&1 | tail -1 || \
+                { rm -rf "$work"; die "git fetch of commit failed."; }
+            runuser -u "$duser" -- git -C "$src" checkout --detach "$src_commit" 2>&1 | tail -1 || \
+                { rm -rf "$work"; die "git checkout of commit failed."; }
+        fi
+        commit="$(runuser -u "$duser" -- git -C "$src" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    else
+        cp -a "$src_dir/." "$src/"
+    fi
+    chown -R "$duser:$duser" "$src"
+
+    local m_version="${version_override:-0.0.0+$commit}"
+    [[ "$m_version" =~ ^[A-Za-z0-9_.+~-]+$ ]] || { rm -rf "$work"; die "Unsafe version: $m_version"; }
+    local stage="$work/stage"
+    mkdir -p "$stage"
+    VGO_DEV_PACKAGE="$pkg" go_build_release "$duser" "$tc_ver" "$src" "$app_name" "$pkg" "$bflags" "$go_mode" "$stage" || \
+        { rm -rf "$work"; die "Build failed."; }
+    cat > "$stage/manifest.json" << EOF
+{
+  "name": "$app_name",
+  "version": "$m_version",
+  "architecture": "linux-amd64",
+  "entrypoint": "bin/$app_name",
+  "health_path": "${HEALTH_PATH:-/health}",
+  "go_mode": "$go_mode",
+  "go_toolchain": "$tc_ver",
+  "go_package": "$pkg",
+  "source_commit": "$commit"
+}
+EOF
+    # Dev releases keep src/ (go run tree); prod keeps bin/ (+src for audit).
+    [[ "$go_mode" == "dev" ]] && rm -rf "$stage/bin"
+    local tar="$work/release.tar.gz"
+    tar czf "$tar" -C "$stage" manifest.json $([[ "$go_mode" == "dev" ]] && echo src || echo "bin src") || \
+        { rm -rf "$work"; die "Stage packaging failed."; }
+
+    # Persist source context for the inner artifact pass.
+    VGO_CTX_URL="$src_url" VGO_CTX_BRANCH="$src_branch" VGO_CTX_COMMIT="$commit" \
+    VGO_CTX_MODE="$go_mode" VGO_CTX_TC="$tc_ver" \
+    cmd_deploy --domain "$domain" --artifact "$tar" --version "$m_version" $([[ "$json" == "1" ]] && echo --json)
+    local rc=$?
+    rm -rf "$work"
+    release_lock 9
+    return $rc
+}
+
 cmd_deploy() {
     require_root
     load_config
     require_python3
 
     local domain="" artifact="" version_override="" json=0
+    local src_url="" src_branch="" src_commit="" src_dir="" pkg="./..." bflags=""
+    local app_name="" go_mode="prod"
+    local orig_args=("$@")
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domain) domain="$2"; shift 2 ;;
             --artifact) artifact="$2"; shift 2 ;;
             --version) version_override="$2"; shift 2 ;;
+            --source) src_url="$2"; shift 2 ;;
+            --branch) src_branch="$2"; shift 2 ;;
+            --commit) src_commit="$2"; shift 2 ;;
+            --source-dir) src_dir="$2"; shift 2 ;;
+            --package) pkg="$2"; shift 2 ;;
+            --build-flags) bflags="$2"; shift 2 ;;
+            --app-name) app_name="$2"; shift 2 ;;
+            --mode) go_mode="$2"; shift 2 ;;
             --json) json=1; shift ;;
             *) shift ;;
         esac
     done
 
     [[ -n "$domain" ]] || die "--domain is required"
+    [[ "$go_mode" == "prod" || "$go_mode" == "dev" ]] || die "--mode must be prod or dev"
+    validate_domain_arg "$domain"
+
+    # Source builds stage a tarball, then run the identical artifact flow
+    # (single pass, same locks via VGO_SKIP_DOMAIN_LOCK).
+    if [[ -n "$src_url" || -n "$src_dir" ]]; then
+        [[ -z "$artifact" ]] || die "Use --artifact or --source, not both."
+        [[ -n "$src_url" && -n "$src_dir" ]] && die "Use --source or --source-dir, not both."
+        if [[ -n "$src_url" ]]; then
+            valid_source_url "$src_url" || die "Source URL must be https:// or git@ (no file://)."
+        else
+            [[ -d "$src_dir" ]] || die "Source dir not found: $src_dir"
+        fi
+        [[ -z "$app_name" ]] && app_name="$(basename "$domain" | cut -d. -f1)"
+        VGO_SRC_MODE="$go_mode" VGO_SRC_PKG="$pkg" \
+        VGO_SRC_URL="$src_url" VGO_SRC_BRANCH="$src_branch" VGO_SRC_COMMIT="$src_commit" \
+        deploy_from_source "${orig_args[@]}"
+        return $?
+    fi
+
     [[ -n "$artifact" ]] || die "--artifact is required"
     validate_domain_arg "$domain"
     [[ -f "$artifact" ]] || die "Artifact not found: $artifact"
@@ -1037,16 +1312,32 @@ cmd_deploy() {
     tar xzf "$artifact" -C "$stage" || { rm -rf "$stage"; die "Artifact extraction failed."; }
     [[ -f "$stage/manifest.json" ]] || { rm -rf "$stage"; die "Artifact missing manifest.json at top level."; }
 
-    local m_name m_version m_arch m_entry m_health
+    local m_name m_version m_arch m_entry m_health m_mode m_tc m_pkg
     m_name="$(manifest_field "$stage/manifest.json" "name")"
     m_version="$(manifest_field "$stage/manifest.json" "version")"
     m_arch="$(manifest_field "$stage/manifest.json" "architecture")"
     m_entry="$(manifest_field "$stage/manifest.json" "entrypoint")"
     m_health="$(manifest_field "$stage/manifest.json" "health_path")"
+    m_mode="$(manifest_field "$stage/manifest.json" "go_mode")"
+    m_tc="$(manifest_field "$stage/manifest.json" "go_toolchain")"
+    m_pkg="$(manifest_field "$stage/manifest.json" "go_package")"
+    # Source-context (VGO_CTX_*) wins; else manifest; else prod defaults.
+    local dep_mode="${VGO_CTX_MODE:-${m_mode:-prod}}"
+    [[ "$dep_mode" == "prod" || "$dep_mode" == "dev" ]] || \
+        { rm -rf "$stage"; die "Unsupported go_mode: $dep_mode"; }
+    local dep_tc="${VGO_CTX_TC:-$m_tc}"
+    local dep_pkg="${VGO_SRC_PKG:-${m_pkg:-.}}"
+    local dep_src_url="${VGO_CTX_URL:-}" dep_src_branch="${VGO_CTX_BRANCH:-}"
+    local dep_src_commit="${VGO_CTX_COMMIT:-}"
+    if [[ "$dep_mode" == "dev" ]]; then
+        [[ -n "$dep_tc" ]] || { rm -rf "$stage"; die "Dev releases need go_toolchain (manifest or pinned)."; }
+        [[ -x "$(tc_dir_for "$dep_tc")/bin/go" ]] || \
+            { rm -rf "$stage"; die "Go toolchain $dep_tc not installed."; }
+    fi
     [[ -n "$version_override" ]] && m_version="$version_override"
     [[ -z "$m_name" ]] && m_name="$domain"
     [[ -n "$m_version" ]] || { rm -rf "$stage"; die "Manifest has no version (or pass --version)."; }
-    [[ "$m_version" =~ ^[A-Za-z0-9_.-]+$ ]] || { rm -rf "$stage"; die "Unsafe version string: $m_version"; }
+    [[ "$m_version" =~ ^[A-Za-z0-9_.+~-]+$ ]] || { rm -rf "$stage"; die "Unsafe version string: $m_version"; }
     [[ -n "$m_entry" ]] || { rm -rf "$stage"; die "Manifest has no entrypoint."; }
     [[ "$m_entry" == *..* ]] && { rm -rf "$stage"; die "Unsafe entrypoint path: $m_entry"; }
     if [[ -n "$m_arch" ]]; then
@@ -1060,8 +1351,13 @@ cmd_deploy() {
     [[ -n "$m_health" ]] || m_health="${HEALTH_PATH:-$GO_DEFAULT_HEALTH_PATH}"
     [[ "$m_health" == /* ]] || { rm -rf "$stage"; die "health_path must start with /: $m_health"; }
 
-    [[ -f "$stage/$m_entry" ]] || { rm -rf "$stage"; die "Entrypoint missing in artifact: $m_entry"; }
-    check_entrypoint_executable "$stage/$m_entry"
+    if [[ "$dep_mode" == "dev" ]]; then
+        [[ -d "$stage/src" ]] || { rm -rf "$stage"; die "Dev artifact missing src/ tree."; }
+        [[ "$dep_pkg" == *..* ]] && { rm -rf "$stage"; die "Unsafe package path: $dep_pkg"; }
+    else
+        [[ -f "$stage/$m_entry" ]] || { rm -rf "$stage"; die "Entrypoint missing in artifact: $m_entry"; }
+        check_entrypoint_executable "$stage/$m_entry"
+    fi
 
     local stamp rid dest
     stamp="$(date +%Y%m%d-%H%M%S)"
@@ -1074,7 +1370,7 @@ cmd_deploy() {
     chown -R "$duser:$duser" "$dest"
     chmod 0750 "$dest"
     cat > "$dest/deploy.json" << EOF
-{"domain":"$domain","version":"$m_version","sha256":"$sha","deployed_at":"$(date -Iseconds)","artifact":"$(basename "$artifact")"}
+{"domain":"$domain","version":"$m_version","sha256":"$sha","deployed_at":"$(date -Iseconds)","artifact":"$(basename "$artifact")","go_mode":"$dep_mode","go_toolchain":"$dep_tc","go_package":"$dep_pkg","source_commit":"$dep_src_commit","source_url":"$dep_src_url"}
 EOF
     chmod 0640 "$dest/deploy.json"
     chown "$duser:$duser" "$dest/deploy.json"
@@ -1090,27 +1386,36 @@ EOF
     set_link "$CURRENT_LINK" "$rid" "$duser"
 
     local entry_abs="${APP_ROOT}/current/${m_entry}"
-    write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" "$entry_abs" "$PORT"
+    local tc_bin=""
+    [[ "$dep_mode" == "dev" ]] && tc_bin="$(tc_dir_for "$dep_tc")/bin/go"
+    VGO_DEV_PACKAGE="$dep_pkg" write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
+        "$entry_abs" "$PORT" "$dep_mode" "$tc_bin"
     ensure_prod_env "$duser" "$duser" "$PORT"
 
     # Persist release metadata (secrets file untouched).
+    heal_registry_fields "$registry"
     sed -i "s|^CURRENT_VERSION='.*'|CURRENT_VERSION='${m_version}'|" "$registry"
     sed -i "s|^DEPLOY_ID='.*'|DEPLOY_ID='${rid}'|" "$registry"
     sed -i "s|^ENTRYPOINT='.*'|ENTRYPOINT='${m_entry}'|" "$registry"
     sed -i "s|^DEPLOY_SHA256='.*'|DEPLOY_SHA256='${sha}'|" "$registry"
+    sed -i "s|^GO_MODE='.*'|GO_MODE='${dep_mode}'|" "$registry"
+    sed -i "s|^SOURCE_URL='.*'|SOURCE_URL='${dep_src_url}'|" "$registry"
+    sed -i "s|^SOURCE_BRANCH='.*'|SOURCE_BRANCH='${dep_src_branch}'|" "$registry"
+    sed -i "s|^SOURCE_COMMIT='.*'|SOURCE_COMMIT='${dep_src_commit}'|" "$registry"
     sed -i "s|^HEALTH_PATH='.*'|HEALTH_PATH='${m_health}'|" "$registry"
     sed -i "s|^ENABLED='.*'|ENABLED='1'|" "$registry"
     write_meta_file "$duser" "$duser" "$PORT" "${PROXY_PATH:-/}" "$m_version" "$m_health" "$rid"
 
     systemd_daemon_reload
     systemctl enable "$SERVICE_NAME" 2>/dev/null || true
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        systemctl restart "$SERVICE_NAME" || warn "Restart signal sent with warnings."
-    else
-        systemctl start "$SERVICE_NAME" || warn "Start signal sent with warnings."
-    fi
+    # Stop-first: never health-check a stale process from the old release.
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    wait_for_port_free "$PORT" 15 || warn "Port $PORT still bound after stop; proceeding anyway."
+    systemctl start "$SERVICE_NAME" || warn "Start signal sent with warnings."
 
-    if wait_for_health "$PORT" "$m_health"; then
+    local gate_retries="${GO_HEALTH_RETRIES:-10}"
+    [[ "$dep_mode" == "dev" ]] && gate_retries="${GO_DEV_HEALTH_RETRIES:-45}"
+    if wait_for_unit_health "$SERVICE_NAME" "$PORT" "$m_health" "$gate_retries"; then
         apply_go_apache "$APACHE_VHOST_FILE" "$domain" "$PORT" "$backup_dir"
         sed -i "s|^APACHE_CONFIG_KIND='.*'|APACHE_CONFIG_KIND='proxy'|" "$registry"
         release_lock 9
@@ -1131,13 +1436,22 @@ EOF
         prev_version="$(manifest_field "$RELEASES_DIR/$old_id/manifest.json" "version")"
         [[ -n "$prev_entry" ]] || prev_entry="$m_entry"
         [[ -n "$prev_version" ]] || prev_version=""
-        write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
-            "${APP_ROOT}/current/${prev_entry}" "$PORT"
+        local rb_mode rb_tc rb_pkg rb_bin
+        rb_mode="$(deploy_field "$RELEASES_DIR/$old_id" "go_mode")"
+        [[ -n "$rb_mode" ]] || rb_mode="prod"
+        rb_tc="$(deploy_field "$RELEASES_DIR/$old_id" "go_toolchain")"
+        rb_pkg="$(deploy_field "$RELEASES_DIR/$old_id" "go_package")"
+        [[ -n "$rb_pkg" ]] || rb_pkg="."
+        rb_bin=""
+        [[ "$rb_mode" == "dev" && -n "$rb_tc" ]] && rb_bin="$(tc_dir_for "$rb_tc")/bin/go"
+        VGO_DEV_PACKAGE="$rb_pkg" write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
+            "${APP_ROOT}/current/${prev_entry}" "$PORT" "$rb_mode" "$rb_bin"
         systemd_daemon_reload
         systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
         sed -i "s|^CURRENT_VERSION='.*'|CURRENT_VERSION='${prev_version}'|" "$registry"
         sed -i "s|^DEPLOY_ID='.*'|DEPLOY_ID='${old_id}'|" "$registry"
         sed -i "s|^ENTRYPOINT='.*'|ENTRYPOINT='${prev_entry}'|" "$registry"
+        sed -i "s|^GO_MODE='.*'|GO_MODE='${rb_mode}'|" "$registry"
         write_meta_file "$duser" "$duser" "$PORT" "${PROXY_PATH:-/}" "$prev_version" "$m_health" "$old_id"
         rm -rf "${RELEASES_DIR:?}/${rid}"
         release_lock 9
@@ -1203,22 +1517,35 @@ cmd_rollback() {
     prev_entry="$(manifest_field "$RELEASES_DIR/$prev/manifest.json" "entrypoint")"
     prev_version="$(manifest_field "$RELEASES_DIR/$prev/manifest.json" "version")"
     [[ -n "$prev_entry" ]] || prev_entry="${ENTRYPOINT:-}"
-    [[ -x "$RELEASES_DIR/$prev/$prev_entry" ]] || die "Previous entrypoint not executable: $prev/$prev_entry"
+    local rb_mode rb_tc rb_pkg rb_bin
+    rb_mode="$(deploy_field "$RELEASES_DIR/$prev" "go_mode")"
+    [[ -n "$rb_mode" ]] || rb_mode="${GO_MODE:-prod}"
+    rb_tc="$(deploy_field "$RELEASES_DIR/$prev" "go_toolchain")"
+    rb_pkg="$(deploy_field "$RELEASES_DIR/$prev" "go_package")"
+    [[ -n "$rb_pkg" ]] || rb_pkg="."
+    release_entry_ok "$prev" "$prev_entry" "$rb_mode" || \
+        die "Previous release entry invalid: $prev/$prev_entry (mode $rb_mode)"
+    rb_bin=""
+    [[ "$rb_mode" == "dev" && -n "$rb_tc" ]] && rb_bin="$(tc_dir_for "$rb_tc")/bin/go"
 
     set_link "$CURRENT_LINK" "$prev" "$duser"
     set_link "$PREVIOUS_LINK" "$cur" "$duser"
 
-    if [[ "$prev_entry" != "${ENTRYPOINT:-}" ]]; then
-        write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
-            "${APP_ROOT}/current/${prev_entry}" "$PORT"
-        systemd_daemon_reload
-    fi
-    systemctl restart "$SERVICE_NAME" || warn "Restart signal sent with warnings."
+    # Always rewrite the unit: mode/toolchain/package may drift across releases.
+    VGO_DEV_PACKAGE="$rb_pkg" write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
+        "${APP_ROOT}/current/${prev_entry}" "$PORT" "$rb_mode" "$rb_bin"
+    systemd_daemon_reload
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    wait_for_port_free "$PORT" 15 || true
+    systemctl start "$SERVICE_NAME" || warn "Restart signal sent with warnings."
 
-    if wait_for_health "$PORT" "${HEALTH_PATH:-/health}"; then
+    local gate_retries="${GO_HEALTH_RETRIES:-10}"
+    [[ "$rb_mode" == "dev" ]] && gate_retries="${GO_DEV_HEALTH_RETRIES:-45}"
+    if wait_for_unit_health "$SERVICE_NAME" "$PORT" "${HEALTH_PATH:-/health}" "$gate_retries"; then
         sed -i "s|^CURRENT_VERSION='.*'|CURRENT_VERSION='${prev_version}'|" "$registry"
         sed -i "s|^DEPLOY_ID='.*'|DEPLOY_ID='${prev}'|" "$registry"
         sed -i "s|^ENTRYPOINT='.*'|ENTRYPOINT='${prev_entry}'|" "$registry"
+        sed -i "s|^GO_MODE='.*'|GO_MODE='${rb_mode}'|" "$registry"
         write_meta_file "$duser" "$duser" "$PORT" "${PROXY_PATH:-/}" "$prev_version" "${HEALTH_PATH:-/health}" "$prev"
         release_lock 9
         if [[ "$json" == "1" ]]; then
@@ -1232,11 +1559,20 @@ cmd_rollback() {
     warn "Rolled-back release unhealthy — swapping back to $cur."
     set_link "$CURRENT_LINK" "$cur" "$duser"
     set_link "$PREVIOUS_LINK" "$prev" "$duser"
-    if [[ "$prev_entry" != "${ENTRYPOINT:-}" ]]; then
-        write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
-            "${APP_ROOT}/current/${ENTRYPOINT}" "$PORT"
-        systemd_daemon_reload
-    fi
+    local cb_mode cb_tc cb_pkg cb_bin
+    cb_mode="$(deploy_field "$RELEASES_DIR/$cur" "go_mode")"
+    [[ -n "$cb_mode" ]] || cb_mode="prod"
+    cb_tc="$(deploy_field "$RELEASES_DIR/$cur" "go_toolchain")"
+    cb_pkg="$(deploy_field "$RELEASES_DIR/$cur" "go_package")"
+    [[ -n "$cb_pkg" ]] || cb_pkg="."
+    cb_bin=""
+    [[ "$cb_mode" == "dev" && -n "$cb_tc" ]] && cb_bin="$(tc_dir_for "$cb_tc")/bin/go"
+    local cb_entry
+    cb_entry="$(manifest_field "$RELEASES_DIR/$cur/manifest.json" "entrypoint")"
+    [[ -n "$cb_entry" ]] || cb_entry="${ENTRYPOINT:-}"
+    VGO_DEV_PACKAGE="$cb_pkg" write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
+        "${APP_ROOT}/current/${cb_entry}" "$PORT" "$cb_mode" "$cb_bin"
+    systemd_daemon_reload
     systemctl restart "$SERVICE_NAME" 2>/dev/null || true
     release_lock 9
     die "Rollback target unhealthy; restored $cur."
@@ -1257,7 +1593,7 @@ compute_go_state() {
     if [[ -L "$CURRENT_LINK" ]]; then
         local rid_now
         rid_now="$(link_id "$CURRENT_LINK")"
-        if release_dir_ok "$rid_now" && [[ -n "${ENTRYPOINT:-}" && -x "$RELEASES_DIR/$rid_now/$ENTRYPOINT" ]]; then
+        if release_dir_ok "$rid_now" && release_entry_ok "$rid_now" "${ENTRYPOINT:-}" "${GO_MODE:-prod}"; then
             release_ok=1
         fi
     fi
@@ -1441,11 +1777,11 @@ cmd_validate() {
         rid_now="$(link_id "$CURRENT_LINK")"
         if release_dir_ok "$rid_now"; then
             _vcheck "PASS" "current symlink valid (-> releases/$rid_now)"
-            if [[ -n "${ENTRYPOINT:-}" && -x "$RELEASES_DIR/$rid_now/$ENTRYPOINT" ]]; then
-                _vcheck "PASS" "Binary executable ($ENTRYPOINT)"
+            if release_entry_ok "$rid_now" "${ENTRYPOINT:-}" "${GO_MODE:-prod}"; then
+                _vcheck "PASS" "Release entry valid (${ENTRYPOINT:-src}, mode ${GO_MODE:-prod})"
                 release_ok=1
             else
-                _vcheck "FAIL" "Binary missing/not executable: ${ENTRYPOINT:-(unset)}"
+                _vcheck "FAIL" "Release entry missing/invalid: ${ENTRYPOINT:-(unset)} (mode ${GO_MODE:-prod})"
             fi
         else
             _vcheck "FAIL" "current symlink broken (-> releases/${rid_now:-(none)})"
@@ -1812,8 +2148,12 @@ cmd_restore() {
         chown -R "$duser:$duser" "$APP_ROOT"
         chmod 0750 "$APP_ROOT"
         [[ -f "$PROD_ENV" ]] && chmod 0600 "$PROD_ENV"
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        wait_for_port_free "$PORT" 15 || true
         systemctl start "$SERVICE_NAME" 2>/dev/null || true
-        if wait_for_health "$PORT" "${HEALTH_PATH:-/health}"; then
+        local gate_retries="${GO_HEALTH_RETRIES:-10}"
+        [[ "${GO_MODE:-prod}" == "dev" ]] && gate_retries="${GO_DEV_HEALTH_RETRIES:-45}"
+        if wait_for_unit_health "$SERVICE_NAME" "$PORT" "${HEALTH_PATH:-/health}" "$gate_retries"; then
             rm -rf "$snap"
             release_lock 9
             if [[ "$json" == "1" ]]; then echo '{"ok":true,"domain":"'"$domain"'","health":"ok"}';
@@ -1835,15 +2175,296 @@ cmd_version() {
     echo "$SCRIPT_VERSION"
 }
 
+###############################################################################
+# T1 — Shared Go toolchain store (/opt, compilers are shared tooling)
+###############################################################################
+valid_tc_version() {
+    [[ "${1:-}" =~ ^(go)?1\.[0-9]+(\.[0-9]+)?$ ]]
+}
+
+# Canonical form: 1.23.0 (no leading "go"). Partial X.Y resolved via feed.
+tc_canonical() {
+    local raw="$1"
+    raw="${raw#go}"
+    if [[ "$raw" =~ ^1\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s' "$raw"
+        return 0
+    fi
+    # Partial: pick newest stable patch from feed.
+    require_python3
+    local feed
+    feed="$(curl -fsSL --max-time 30 "$GO_DL_FEED" 2>/dev/null)" || \
+        die "Could not fetch Go version feed (network or go.dev unreachable)."
+    python3 - "$feed" "$raw" << 'PYEOF' || die "No stable Go release matches '$raw'."
+import json, sys
+feed = json.loads(sys.argv[1])
+want = sys.argv[2]
+cands = [e["version"] for e in feed
+         if e.get("stable") and e.get("version", "").lstrip("go").startswith(want + ".")]
+if not cands:
+    sys.exit(1)
+def key(v):
+    return tuple(int(x) for x in v.lstrip("go").split("."))
+print(sorted(cands, key=key)[-1].lstrip("go"))
+PYEOF
+}
+
+tc_dir_for() {
+    printf '%s/%s' "$TOOLCHAINS_BASE" "$1"
+}
+
+current_tc_version() {
+    local tgt=""
+    tgt="$(readlink "$CURRENT_TC_LINK" 2>/dev/null || true)"
+    printf '%s' "$(basename "$tgt")"
+}
+
+# Resolve effective toolchain for a domain: pin or global current.
+resolve_tc_for_domain() {
+    local pin="${1:-}" ver=""
+    if [[ -n "$pin" ]]; then
+        ver="$pin"
+    else
+        ver="$(current_tc_version)"
+    fi
+    [[ -n "$ver" ]] || die "No Go toolchain available (install one or set current)."
+    local dir
+    dir="$(tc_dir_for "$ver")"
+    [[ -x "$dir/bin/go" ]] || die "Go toolchain $ver not installed ($dir/bin/go missing)."
+    printf '%s' "$ver"
+}
+
+tc_fetch_spec() {
+    # Echo: filename sha256 — for canonical version from official feed.
+    local ver="$1"
+    require_python3
+    local feed
+    feed="$(curl -fsSL --max-time 30 "$GO_DL_FEED" 2>/dev/null)" || \
+        die "Could not fetch Go version feed."
+    python3 - "$feed" "$ver" << 'PYEOF' || die "No official linux/amd64 file for Go $ver."
+import json, sys
+feed = json.loads(sys.argv[1])
+want = "go" + sys.argv[2]
+for e in feed:
+    if e.get("version") == want and e.get("stable"):
+        for f in e.get("files", []):
+            if (f.get("os") == "linux" and f.get("arch") == "amd64"
+                    and f.get("kind") == "archive"):
+                print(f["filename"], f["sha256"])
+                sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+
+cmd_install_toolchain() {
+    require_root
+    load_config
+    local want="" set_current=0 json=0 allow_online="$GO_ALLOW_ONLINE_TOOLCHAIN_DOWNLOAD"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) want="$2"; shift 2 ;;
+            --latest) want="__latest__"; shift ;;
+            --set-current) set_current=1; shift ;;
+            --allow-online) allow_online=1; shift ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ "$allow_online" == "1" ]] || \
+        die "Online toolchain download is disabled (GO_ALLOW_ONLINE_TOOLCHAIN_DOWNLOAD=0). Enable it or pre-stage the tarball."
+    [[ -n "$want" ]] || die "--version X.Y.Z or --latest is required"
+    require_python3
+    local ver
+    if [[ "$want" == "__latest__" ]]; then
+        local feed
+        feed="$(curl -fsSL --max-time 30 "$GO_DL_FEED" 2>/dev/null)" || die "Feed unreachable."
+        ver="$(python3 -c "import json,sys; print([e['version'] for e in json.load(open('/dev/stdin')) if e.get('stable')][0].lstrip('go'))" <<< "$feed")"
+    else
+        valid_tc_version "$want" || die "Invalid Go version: $want (want like 1.23.0)"
+        ver="$(tc_canonical "$want")"
+    fi
+    local dest
+    dest="$(tc_dir_for "$ver")"
+    if [[ -x "$dest/bin/go" ]]; then
+        [[ "$set_current" == "1" ]] && cmd_set_current_toolchain --version "$ver"
+        [[ "$json" == "1" ]] && echo '{"ok":true,"version":"'"$ver"'","installed":true}' || info "Go $ver already installed."
+        return 0
+    fi
+    local spec filename sha
+    spec="$(tc_fetch_spec "$ver")"
+    filename="$(echo "$spec" | awk '{print $1}')"
+    sha="$(echo "$spec" | awk '{print $2}')"
+    local tmpd
+    tmpd="$(mktemp -d)"
+    curl -fsSL --max-time 300 -o "$tmpd/$filename" "https://go.dev/dl/$filename" || \
+        { rm -rf "$tmpd"; die "Download failed: $filename"; }
+    echo "$sha  $tmpd/$filename" | sha256sum -c - 2>/dev/null || \
+        { rm -rf "$tmpd"; die "SHA-256 mismatch for $filename (not installing)."; }
+    mkdir -p "$TOOLCHAINS_BASE"
+    tar xzf "$tmpd/$filename" -C "$tmpd" || { rm -rf "$tmpd"; die "Extraction failed."; }
+    [[ -x "$tmpd/go/bin/go" ]] || { rm -rf "$tmpd"; die "Tarball lacks go/bin/go."; }
+    mv "$tmpd/go" "$dest" || { rm -rf "$tmpd"; die "Could not publish $dest."; }
+    rm -rf "$tmpd"
+    chown -R root:root "$dest"
+    chmod -R go-w "$dest" 2>/dev/null || true
+    "$dest/bin/go" version 2>/dev/null | head -1 || warn "Installed but 'go version' probe failed."
+    if [[ "$set_current" == "1" ]]; then
+        cmd_set_current_toolchain --version "$ver"
+    fi
+    if [[ "$json" == "1" ]]; then
+        echo '{"ok":true,"version":"'"$ver"'","installed":true}'
+    else
+        info "Installed Go toolchain $ver ($dest)."
+    fi
+}
+
+cmd_list_toolchains() {
+    load_config
+    local json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    local cur
+    cur="$(current_tc_version)"
+    if [[ "$json" == "1" ]]; then
+        printf '{"current":"%s","toolchains":[' "$cur"
+        local first=1 d v pinned
+        for d in "$TOOLCHAINS_BASE"/*/; do
+            [[ -L "${d%/}" ]] && continue
+            [[ -x "${d}bin/go" ]] || continue
+            v="$(basename "$d")"
+            pinned="$(grep -l "^GO_TOOLCHAIN='$v'" "$INSTANCES_DIR"/*.conf 2>/dev/null | xargs -r -n1 basename 2>/dev/null | sed 's/\.conf$//' | tr '\n' ',' || true)"
+            [[ "$first" == "1" ]] && first=0 || printf ','
+            printf '{"version":"%s","pinned_by":"%s"}' "$v" "$pinned"
+        done
+        printf ']}\n'
+        return 0
+    fi
+    for d in "$TOOLCHAINS_BASE"/*/; do
+        [[ -L "${d%/}" ]] && continue
+        [[ -x "${d}bin/go" ]] || continue
+        v="$(basename "$d")"
+        local tags=""
+        [[ "$v" == "$cur" ]] && tags+=" current"
+        local pin
+        pin="$(grep -l "^GO_TOOLCHAIN='$v'" "$INSTANCES_DIR"/*.conf 2>/dev/null | xargs -r -n1 basename 2>/dev/null | sed 's/\.conf$//' | tr '\n' ' ' || true)"
+        [[ -n "$pin" ]] && tags+=" pinned:$pin"
+        echo "$v$tags"
+    done
+}
+
+cmd_set_current_toolchain() {
+    require_root
+    load_config
+    local ver=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) ver="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$ver" ]] || die "--version is required"
+    ver="$(tc_canonical "$ver")"
+    [[ -x "$(tc_dir_for "$ver")/bin/go" ]] || die "Go $ver is not installed."
+    mkdir -p "$TOOLCHAINS_BASE"
+    local tmp="$CURRENT_TC_LINK.new.$$"
+    rm -f "$tmp"
+    ln -s "$ver" "$tmp" && mv -f "$tmp" "$CURRENT_TC_LINK" || \
+        { rm -f "$tmp"; die "Could not publish current link."; }
+    info "Go $ver is now the default toolchain."
+}
+
+cmd_remove_toolchain() {
+    require_root
+    load_config
+    local ver="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) ver="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$ver" ]] || die "--version is required"
+    ver="$(tc_canonical "$ver")"
+    local users
+    users="$(grep -l "^GO_TOOLCHAIN='$ver'" "$INSTANCES_DIR"/*.conf 2>/dev/null || true)"
+    [[ -z "$users" ]] || die "Go $ver is pinned by: $(echo "$users" | xargs -n1 basename 2>/dev/null | tr '\n' ' ') — unpin first."
+    [[ "$(current_tc_version)" != "$ver" ]] || die "Go $ver is the current default — set another current first."
+    rm -rf "$(tc_dir_for "$ver")"
+    [[ "$json" == "1" ]] && echo '{"ok":true,"removed":"'"$ver"'"}' || info "Removed Go toolchain $ver."
+}
+
+cmd_check_toolchain_updates() {
+    load_config
+    require_python3
+    local json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    local feed
+    feed="$(curl -fsSL --max-time 30 "$GO_DL_FEED" 2>/dev/null)" || die "Feed unreachable."
+    local stable
+    stable="$(python3 -c "import json,sys; print([e['version'] for e in json.load(open('/dev/stdin')) if e.get('stable')][0])" <<< "$feed")"
+    local cur="none"
+    [[ -n "$(current_tc_version)" ]] && cur="go$(current_tc_version)"
+    if [[ "$json" == "1" ]]; then
+        echo '{"stable":"'"$stable"'","current_default":"'"$cur"'"}'
+    else
+        echo "Stable upstream: $stable"
+        echo "Current default: $cur"
+    fi
+}
+
+cmd_pin_toolchain() {
+    require_root
+    load_config
+    local domain="" ver="" unpin=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --version) ver="$2"; shift 2 ;;
+            --follow-default) unpin=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+    get_domain_lock "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry for $domain. Run enable first."
+    # Pre-T1 registries lack the GO_TOOLCHAIN line; heal before sed.
+    grep -q "^GO_TOOLCHAIN=" "$registry" || echo "GO_TOOLCHAIN=''" >> "$registry"
+    if [[ "$unpin" == "1" ]]; then
+        sed -i "s|^GO_TOOLCHAIN='.*'|GO_TOOLCHAIN=''|" "$registry"
+        release_lock 9
+        info "$domain now follows the default toolchain."
+        return 0
+    fi
+    [[ -n "$ver" ]] || die "--version or --follow-default is required"
+    ver="$(tc_canonical "$ver")"
+    [[ -x "$(tc_dir_for "$ver")/bin/go" ]] || die "Go $ver is not installed."
+    sed -i "s|^GO_TOOLCHAIN='.*'|GO_TOOLCHAIN='${ver}'|" "$registry"
+    release_lock 9
+    info "$domain pinned to Go $ver."
+}
+
 usage() {
     cat << EOF
 virtualmin-go $SCRIPT_VERSION — versioned Go deployments per Virtualmin server
 
 Usage: $SCRIPT_NAME <command> [options]
 
-  enable    --domain D [--port P] [--proxy-path /] [--health-path H] [--ready-path R]
+  enable    --domain D [--port P] [--proxy-path /] [--health-path H] [--ready-path R] [--toolchain V]
   disable   --domain D
   deploy    --domain D --artifact FILE.tar.gz [--version V]
+  pin-toolchain --domain D (--version V | --follow-default)
   rollback  --domain D
   start     --domain D
   stop      --domain D
@@ -1856,6 +2477,11 @@ Usage: $SCRIPT_NAME <command> [options]
   prune-releases --domain D [--keep N]
   backup    --domain D --dest FILE.tar.gz
   restore   --domain D --source FILE.tar.gz
+  install-toolchain (--version V | --latest) [--set-current] [--allow-online]
+  list-toolchains [--json]
+  set-current-toolchain --version V
+  remove-toolchain --version V
+  check-updates [--json]
   list [--json]
   version
 EOF
@@ -1880,6 +2506,12 @@ main() {
         prune-releases) cmd_prune_releases "$@" ;;
         backup) cmd_backup "$@" ;;
         restore) cmd_restore "$@" ;;
+        install-toolchain) cmd_install_toolchain "$@" ;;
+        list-toolchains) cmd_list_toolchains "$@" ;;
+        set-current-toolchain) cmd_set_current_toolchain "$@" ;;
+        remove-toolchain) cmd_remove_toolchain "$@" ;;
+        check-updates) cmd_check_toolchain_updates "$@" ;;
+        pin-toolchain) cmd_pin_toolchain "$@" ;;
         list) cmd_list "$@" ;;
         version|--version|-V) cmd_version ;;
         help|--help|-h|"") usage ;;

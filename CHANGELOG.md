@@ -1,5 +1,29 @@
 # Changelog — virtualmin-go
 
+## Unreleased — v0.2 (T1 toolchain store + T2 source builds, disposable-proven)
+
+- Shared toolchain store `/opt/virtualmin-go/toolchains/<ver>/` + `current`
+  (compilers are shared tooling like the PB runtime; app binaries stay in
+  `apps/go`). Commands: `install-toolchain` (official tarball + SHA-256 vs
+  `go.dev/dl/?mode=json`, offline by default), `list-toolchains`,
+  `set-current-toolchain`, `remove-toolchain` (refuses pins + current),
+  `check-updates`, `pin-toolchain`/`--follow-default`, `enable --toolchain`.
+- Build-from-source deploy: `--source <git-url> [--branch] [--commit]` and
+  `--source-dir`, built as the domain user with pinned toolchain,
+  instance-scoped `GOCACHE`/`GOMODCACHE`, `GOTOOLCHAIN=local`,
+  `CGO_ENABLED=0`; then the identical atomic releases/health-gated flow.
+  Registry: `SOURCE_URL/BRANCH/COMMIT`, `GO_MODE`, per-release `deploy.json`
+  carries mode/toolchain/package/commit.
+- Dev mode (`--mode dev`): unit runs `<toolchain>/bin/go run <pkg>` from
+  `current/src` with cache env; rollback always rewrites the unit (mode/tc
+  drift safe).
+- Hardened health gate (stale-process lesson): stop-first, port-free wait,
+  listener must be the unit MainPID or its child (`go run` supervisor),
+  combined verify+health loop with longer dev retries.
+- Fixes along the way: `^(go)?` version regex, `releases/<id>` symlink
+  targets (recurring), `-L` with trailing slash, prune dedupe, grep `-H`,
+  pipefail guards, corrupt-unit newline, pre-T1 registry field healing.
+
 ## 0.1.1 (2026-09-21)
 
 - Ownership contract (AGENTS.md/README.md): module owns only its marker
