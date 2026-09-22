@@ -16,12 +16,12 @@
 
 =head1 NAME
 
-virtualmin-go-lib.pl - shared safety, UI and operations library
+virtualmin-go-app-lib.pl - shared safety, UI and operations library
 
 =head1 DESCRIPTION
 
 Keeps the Webmin module compatible with the external
-C</usr/local/sbin/virtualmin-go> manager while ensuring that module
+C</usr/local/sbin/virtualmin-go-app> manager while ensuring that module
 requests never construct shell command strings. Mutating commands are
 serialized with locks and recorded in a private audit log. Secrets stored
 in C<production.env> are never read or printed by this library.
@@ -51,10 +51,10 @@ our (%config, %text, %in, %access, $remote_user, $module_name);
 eval { &foreign_require('virtual-server'); };
 eval { %access = &get_module_acl(); };
 
-our $SCRIPT_NAME = 'virtualmin-go';
-our $CLI = $config{'cli'} || '/usr/local/sbin/virtualmin-go';
-our $CONFIG_FILE = $ENV{'VGO_CONFIG_FILE'} || '/etc/virtualmin-go/config';
-our $INSTANCES_DIR = $ENV{'VGO_INSTANCES_DIR'} || '/etc/virtualmin-go/instances.d';
+our $SCRIPT_NAME = 'virtualmin-go-app';
+our $CLI = $config{'cli'} || '/usr/local/sbin/virtualmin-go-app';
+our $CONFIG_FILE = $ENV{'VGO_CONFIG_FILE'} || '/etc/virtualmin-go-app/config';
+our $INSTANCES_DIR = $ENV{'VGO_INSTANCES_DIR'} || '/etc/virtualmin-go-app/instances.d';
 
 sub vgo_version { return '0.2.0'; }
 sub vgo_now_iso { return strftime('%Y-%m-%dT%H:%M:%S%z', localtime()); }
@@ -94,10 +94,10 @@ sub vgo_int_config
 sub vgo_command_timeout { return vgo_int_config('command_timeout', 180, 5, 3600); }
 sub vgo_max_output_bytes { return vgo_int_config('max_output_bytes', 2097152, 65536, 33554432); }
 sub vgo_max_log_lines { return vgo_int_config('max_log_lines', 1000, 100, 5000); }
-sub vgo_report_dir { return $config{'report_dir'} || '/root/service-reports/virtualmin-go'; }
-sub vgo_backup_dir { return $config{'backup_dir'} || '/root/service-backups/virtualmin-go'; }
-sub vgo_lock_dir { return $config{'lock_dir'} || '/run/lock/virtualmin-go-web'; }
-sub vgo_audit_log { return $config{'audit_log'} || '/var/log/virtualmin-go/web-actions.log'; }
+sub vgo_report_dir { return $config{'report_dir'} || '/root/service-reports/virtualmin-go-app'; }
+sub vgo_backup_dir { return $config{'backup_dir'} || '/root/service-backups/virtualmin-go-app'; }
+sub vgo_lock_dir { return $config{'lock_dir'} || '/run/lock/virtualmin-go-app-web'; }
+sub vgo_audit_log { return $config{'audit_log'} || '/var/log/virtualmin-go-app/web-actions.log'; }
 
 sub vgo_ensure_dir
 {

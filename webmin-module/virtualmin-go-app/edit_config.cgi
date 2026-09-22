@@ -1,11 +1,11 @@
 #!/usr/bin/perl
-# virtualmin-go edit_config.cgi — Global Settings (external manager config)
+# virtualmin-go-app edit_config.cgi — Global Settings (external manager config)
 # Mirrors virtualmin-pocketbase/edit_config.cgi: validated inputs, atomic
 # publish with backup, audit trail. Never touches instance secrets.
 use strict;
 use warnings;
 our (%in, %config, %text, $CONFIG_FILE);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my $cfg = vgo_global_config();
@@ -68,7 +68,7 @@ if (uc($ENV{'REQUEST_METHOD'} || 'GET') eq 'POST' && $in{'save'}) {
     }
     my $tmp = "$CONFIG_FILE.tmp.$$";
     open(my $fh, '>', $tmp) || &error("Cannot write temporary config: $!");
-    print $fh "# virtualmin-go global config\n# Updated ".vgo_now_iso()." through Webmin\n\n";
+    print $fh "# virtualmin-go-app global config\n# Updated ".vgo_now_iso()." through Webmin\n\n";
     my %printed;
     for my $key (@keys) {
         if (exists($new{$key})) {

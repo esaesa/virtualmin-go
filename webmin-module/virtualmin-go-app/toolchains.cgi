@@ -1,11 +1,11 @@
 #!/usr/bin/perl
-# virtualmin-go toolchains.cgi — shared Go toolchain store management
+# virtualmin-go-app toolchains.cgi — shared Go toolchain store management
 # Mirrors virtualmin-pocketbase/binaries.cgi. Global install/set-current/
 # remove are master-only; per-instance pins respect owner visibility.
 use strict;
 use warnings;
 our (%in, %config, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my ($message, $type, $details) = ('', 'info', '');
@@ -86,7 +86,7 @@ my ($rc, $out) = vgo_run_opts({ timeout => 30 }, 'list-toolchains', '--json');
 my $data = vgo_json_from_output($out) || {};
 my $current = $data->{'current'} || '';
 my @tcs = ref($data->{'toolchains'}) eq 'ARRAY' ? @{$data->{'toolchains'}} : ();
-print "<p>Shared compilers in <tt>/opt/virtualmin-go/toolchains</tt>. Default: <b>".vgo_html($current || '(none)')."</b>. Application binaries stay per-instance under <tt>apps/go</tt>.</p>\n";
+print "<p>Shared compilers in <tt>/opt/virtualmin-go-app/toolchains</tt>. Default: <b>".vgo_html($current || '(none)')."</b>. Application binaries stay per-instance under <tt>apps/go</tt>.</p>\n";
 if (@tcs) {
     print "<table class='ui_table' width='100%'>\n";
     print "<tr><th>Version</th><th>Pinned by</th><th>Actions</th></tr>\n";

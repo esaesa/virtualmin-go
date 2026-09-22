@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# precheck.sh — Read-only environment precheck for virtualmin-go
+# precheck.sh — Read-only environment precheck for virtualmin-go-app
 set -euo pipefail
 TS="$(date +%F-%H%M%S)"
-REPORT="/root/virtualmin-go-precheck-$TS.txt"
+REPORT="/root/virtualmin-go-app-precheck-$TS.txt"
 {
   echo "===== Virtualmin Go precheck ====="
   date

@@ -1,4 +1,4 @@
-# virtualmin-go global defaults (copied to /etc/virtualmin-go/config on install)
+# virtualmin-go-app global defaults (copied to /etc/virtualmin-go-app/config on install)
 GO_BASE_PORT=18100
 GO_MAX_PORT=18199
 GO_LISTEN_HOST=127.0.0.1

@@ -1,10 +1,10 @@
 #!/usr/bin/perl
-# virtualmin-go deploy.cgi — deploy a release (upload tarball / git source)
+# virtualmin-go-app deploy.cgi — deploy a release (upload tarball / git source)
 # Domain owners may deploy only their own instances; see vgo_assert_visible.
 use strict;
 use warnings;
 our (%in, %text, %config);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my @instances = &vgo_visible_instances();

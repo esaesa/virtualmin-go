@@ -1,9 +1,9 @@
 #!/usr/bin/perl
-# virtualmin-go action.cgi — confirmed mutating actions (restart/rollback/prune)
+# virtualmin-go-app action.cgi — confirmed mutating actions (restart/rollback/prune)
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my $domain = &vgo_request_domain();

@@ -1,10 +1,10 @@
 #!/usr/bin/perl
-# virtualmin-go operations.cgi — bulk validate/restart across visible
+# virtualmin-go-app operations.cgi — bulk validate/restart across visible
 # instances with typed confirmation (mirrors PB operations page).
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my @instances = &vgo_visible_instances();

@@ -1,9 +1,9 @@
 #!/usr/bin/perl
-# virtualmin-go open.cgi — bounce to the public site (mirrors PB open.cgi).
+# virtualmin-go-app open.cgi — bounce to the public site (mirrors PB open.cgi).
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my $domain = &vgo_request_domain();

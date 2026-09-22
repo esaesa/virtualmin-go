@@ -21,13 +21,13 @@ $SERVER_HOME/apps/go/
 ├── data/uploads, data/results
 ├── models/
 ├── tmp/
-└── .virtualmin-go.env        # module metadata only (no secrets)
+└── .virtualmin-go-app.env        # module metadata only (no secrets)
 ```
 
 - Ports: `18100–18199` (PocketBase keeps `18000–18099`). Bind `127.0.0.1` only.
-- systemd: `virtualmin-go-<domain>.service`, runs as the Virtualmin domain
+- systemd: `virtualmin-go-app-<domain>.service`, runs as the Virtualmin domain
   owner, `EnvironmentFile=.../config/production.env`.
-- Apache: managed `BEGIN/END VIRTUALMIN-GO <domain>` block for `/` only.
+- Apache: managed `BEGIN/END VIRTUALMIN-GO-APP <domain>` block for `/` only.
   Never touches `/pb/`, `/.well-known`, redirects, or SSL directives. The
   specific `/pb/` block must sort before the `/` catch-all.
 - TLS stays with Virtualmin/Apache. Go listens plain HTTP on localhost.
@@ -38,9 +38,9 @@ $SERVER_HOME/apps/go/
 ## Layout
 
 ```text
-sbin/virtualmin-go                  # root CLI lifecycle manager
-webmin-module/virtualmin-go/        # Virtualmin feature + Webmin UI
-etc/virtualmin-go/config.default    # global defaults (port range, etc.)
+sbin/virtualmin-go-app                  # root CLI lifecycle manager
+webmin-module/virtualmin-go-app/        # Virtualmin feature + Webmin UI
+etc/virtualmin-go-app/config.default    # global defaults (port range, etc.)
 scripts/{install,uninstall,precheck,postinstall}.sh
 tests/                              # syntax + lifecycle tests
 docs/                               # milestone notes
@@ -49,12 +49,12 @@ docs/                               # milestone notes
 ## Ownership boundary (shared with virtualmin-pocketbase)
 
 The module owns only: `apps/go/**`, its registries, its systemd units, and
-the lines between `BEGIN/END VIRTUALMIN-GO <domain>` in the `:443` vhost.
+the lines between `BEGIN/END VIRTUALMIN-GO-APP <domain>` in the `:443` vhost.
 Vhost structure, `:80` content, scheme/host redirects, and SSL directives are
 Virtualmin-owned — the module detects gaps (e.g. missing http→https redirect)
 as `validate` WARNs with the native fix, never hand-edits them.
 
-Shared Go toolchains live in `/opt/virtualmin-go/toolchains/<ver>/`:
+Shared Go toolchains live in `/opt/virtualmin-go-app/toolchains/<ver>/`:
 compilers are shared tooling (same category as the PocketBase runtime);
 application binaries always stay per-instance under `apps/go`.
 
@@ -74,10 +74,10 @@ rollback. UI (`deploy.cgi`) offers upload + git + dev to domain owners
 ## CLI lifecycle
 
 ```text
-virtualmin-go enable | disable | deploy | rollback
-virtualmin-go start | stop | restart
-virtualmin-go status | validate | remove
-virtualmin-go logs | releases | prune-releases | list | backup | restore
+virtualmin-go-app enable | disable | deploy | rollback
+virtualmin-go-app start | stop | restart
+virtualmin-go-app status | validate | remove
+virtualmin-go-app logs | releases | prune-releases | list | backup | restore
 ```
 
 ## License

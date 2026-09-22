@@ -1,9 +1,9 @@
 #!/usr/bin/perl
-# virtualmin-go index.cgi — dashboard of Go application instances
+# virtualmin-go-app index.cgi — dashboard of Go application instances
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 &ui_print_header(undef, 'Go Applications', '', 'go');

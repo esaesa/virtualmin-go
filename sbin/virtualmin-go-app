@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-# virtualmin-go — Root CLI manager for Go application instances
+# virtualmin-go-app — Root CLI manager for Go application instances
 # Version: 0.1.1
 set -euo pipefail
 
@@ -22,14 +22,14 @@ set -euo pipefail
 ###############################################################################
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_VERSION="0.1.1"
-readonly LOCK_DIR="/tmp/virtualmin-go/locks"
-readonly INSTANCES_DIR="/etc/virtualmin-go/instances.d"
-readonly CONFIG_FILE="/etc/virtualmin-go/config"
-readonly CONFIG_DEFAULT="/etc/virtualmin-go/config.default"
-readonly BACKUP_BASE="/etc/virtualmin-go/backups"
+readonly LOCK_DIR="/tmp/virtualmin-go-app/locks"
+readonly INSTANCES_DIR="/etc/virtualmin-go-app/instances.d"
+readonly CONFIG_FILE="/etc/virtualmin-go-app/config"
+readonly CONFIG_DEFAULT="/etc/virtualmin-go-app/config.default"
+readonly BACKUP_BASE="/etc/virtualmin-go-app/backups"
 readonly CHANGE_BASE="/root"
 
-# Defaults (overridden by /etc/virtualmin-go/config)
+# Defaults (overridden by /etc/virtualmin-go-app/config)
 GO_BASE_PORT=18100
 GO_MAX_PORT=18199
 GO_LISTEN_HOST="127.0.0.1"
@@ -51,8 +51,8 @@ GO_DEV_HEALTH_RETRIES=45
 
 # Shared Go toolchain store (compilers are shared tooling like the
 # PocketBase runtime — application binaries stay in $SERVER_HOME/apps/go).
-readonly TOOLCHAINS_BASE="/opt/virtualmin-go/toolchains"
-readonly CURRENT_TC_LINK="/opt/virtualmin-go/toolchains/current"
+readonly TOOLCHAINS_BASE="/opt/virtualmin-go-app/toolchains"
+readonly CURRENT_TC_LINK="/opt/virtualmin-go-app/toolchains/current"
 readonly GO_DL_FEED="https://go.dev/dl/?mode=json"
 
 ###############################################################################
@@ -263,7 +263,7 @@ build_go_paths() {
     GO_RESULTS_DIR="${GO_DATA_DIR}/results"
     GO_MODELS_DIR="${GO_APP_ROOT}/models"
     GO_TMP_DIR="${GO_APP_ROOT}/tmp"
-    GO_META_FILE="${GO_APP_ROOT}/.virtualmin-go.env"
+    GO_META_FILE="${GO_APP_ROOT}/.virtualmin-go-app.env"
 }
 
 ensure_go_tree() {
@@ -287,7 +287,7 @@ ensure_prod_env() {
     local user="$1" group="$2" port="$3"
     if [[ ! -f "$GO_PROD_ENV" ]]; then
         cat > "$GO_PROD_ENV" << EOF
-# Managed by virtualmin-go. Secrets and app environment live here.
+# Managed by virtualmin-go-app. Secrets and app environment live here.
 # This file is NEVER overwritten by deploy or rollback.
 # GO_ADDR/GO_PORT below are module-managed (port allocation owns them);
 # add your own application secrets/variables on new lines.
@@ -321,7 +321,7 @@ sync_prod_env_port() {
     fi
 }
 
-# .virtualmin-go.env holds module-owned metadata only. No secrets.
+# .virtualmin-go-app.env holds module-owned metadata only. No secrets.
 write_meta_file() {
     local user="$1" group="$2" port="$3" proxy_path="$4" version="$5" health_path="$6" deploy_id="$7"
     cat > "$GO_META_FILE" << EOF
@@ -342,7 +342,8 @@ write_registry() {
     local enabled="${14}" apache_kind="${15}" apache_vhost="${16}"
     local toolchain="${17:-}"
     local src_url="${18:-}" src_branch="${19:-}" src_commit="${20:-}" go_mode="${21:-prod}"
-    local unit="virtualmin-go-${domain}.service"
+    local unit
+    unit="$(go_unit_name_for "$domain")"
     cat > "$registry" << EOF
 DOMAIN='${domain}'
 USER='${user}'
@@ -378,7 +379,7 @@ ENABLED='${enabled}'
 APACHE_VHOST_FILE='${apache_vhost}'
 APACHE_CONFIG_KIND='${apache_kind}'
 CREATED_AT='$(date -Iseconds)'
-MANAGED_BY='virtualmin-go'
+MANAGED_BY='virtualmin-go-app'
 EOF
     chmod 0640 "$registry"
 }
@@ -426,6 +427,73 @@ alloc_go_port() {
 ###############################################################################
 # systemd
 ###############################################################################
+go_unit_name_for() {
+    # systemd-escape when available; fall back to safe substitution.
+    # Dots/dashes are valid in unit names, so api.novel-co.com renders
+    # naturally as virtualmin-go-app-api.novel-co.com.service.
+    local domain="$1" esc=""
+    if command -v systemd-escape &>/dev/null; then
+        esc="$(systemd-escape --escape "$domain" 2>/dev/null || true)"
+    fi
+    [[ -n "$esc" ]] || esc="$(printf '%s' "$domain" | sed 's/[^A-Za-z0-9_.-]/-/g')"
+    printf 'virtualmin-go-app-%s.service' "$esc"
+}
+
+validate_artifact_listing() {
+    # Reject untrusted tar content before extraction: absolute paths,
+    # parent traversal, device nodes, or symlinks escaping the release root.
+    # NOTE: GNU tar sanitizes `tar tzf` output (strips leading / and ../),
+    # so raw headers are inspected via python tarfile instead.
+    local artifact="$1" entry
+    local listing
+    if command -v python3 &>/dev/null; then
+        listing="$(python3 -c "import tarfile,sys; print('\n'.join(tarfile.open(sys.argv[1],'r:gz').getnames()))" "$artifact" 2>/dev/null)" \
+            || die "Artifact listing failed."
+    else
+        listing="$(tar tzf "$artifact" 2>/dev/null)" || die "Artifact listing failed."
+    fi
+    [[ -n "$listing" ]] || die "Artifact is empty."
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        [[ "$entry" == /* ]] && die "Unsafe artifact entry (absolute path): $entry"
+        [[ "$entry" == *..* ]] && die "Unsafe artifact entry (traversal): $entry"
+    done <<< "$listing"
+    # Device files / fifos / symlinks: inspect raw headers via python
+    # (tar tzvf output is also sanitized for absolute/traversal targets).
+    if command -v python3 &>/dev/null; then
+        local py_out
+        py_out="$(python3 -c "
+import tarfile,sys
+t = tarfile.open(sys.argv[1],'r:gz')
+for m in t.getmembers():
+    if m.isdev() or m.isfifo():
+        print('BAD-DEVICE ' + m.name); break
+    if m.issym() or m.islnk():
+        ln = m.linkname or ''
+        if ln.startswith('/') or '..' in ln or '..' in m.name or m.name.startswith('/'):
+            print('BAD-LINK ' + m.name + ' -> ' + ln); break
+" "$artifact" 2>/dev/null)" || die "Artifact inspection failed."
+        [[ -n "$py_out" ]] && die "Unsafe artifact entry: $py_out"
+        return 0
+    fi
+    local vline fname ftype link
+    while IFS= read -r vline; do
+        [[ -n "$vline" ]] || continue
+        ftype="${vline:0:1}"
+        case "$ftype" in
+            b|c|p) die "Unsafe artifact entry (device/fifo): $vline" ;;
+        esac
+        if [[ "$ftype" == "l" ]]; then
+            # symlink line: "... name -> target"
+            fname="$(printf '%s' "$vline" | awk '{print $NF}')"
+            link="$(printf '%s' "$vline" | sed -n 's/.* -> //p')"
+            [[ -n "$link" ]] || die "Unsafe symlink entry: $vline"
+            [[ "$link" == /* ]] && die "Unsafe symlink (absolute target): $vline"
+            [[ "$link" == *..* ]] && die "Unsafe symlink (traversal): $vline"
+        fi
+    done <<< "$(tar tzvf "$artifact" 2>/dev/null || true)"
+}
+
 write_go_systemd_unit() {
     local unit_file="$1" domain="$2" user="$3" group="$4"
     local entrypoint_abs="$5" port="$6" mode="${7:-prod}" tc_bin="${8:-}"
@@ -444,7 +512,7 @@ Environment=GOTOOLCHAIN=local
     local nofile="${GO_DEFAULT_LIMIT_NOFILE:-65535}"
     cat > "$unit_file" << UNITEOF
 [Unit]
-Description=Go application for ${domain} (virtualmin-go, ${mode})
+Description=Go application for ${domain} (virtualmin-go-app, ${mode})
 After=network.target
 
 [Service]
@@ -471,8 +539,11 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 
-StandardOutput=append:${GO_APP_ROOT}/go.log
-StandardError=append:${GO_APP_ROOT}/go.log
+# journald is the default log sink (no app-managed log file).
+# Application audit/event logs belong under data/ if required.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=%N
 
 [Install]
 WantedBy=multi-user.target
@@ -589,7 +660,7 @@ write_go_proxy_block() {
         remoteip_block=$'\nRemoteIPHeader X-Forwarded-For\nRemoteIPTrustedProxy 127.0.0.1'
     fi
     cat << EOF
-# BEGIN VIRTUALMIN-GO ${domain}
+# BEGIN VIRTUALMIN-GO-APP ${domain}
 ProxyPreserveHost On
 ProxyRequests Off
 
@@ -600,7 +671,7 @@ RequestHeader set X-Real-IP "%{X-Real-IP}s"${remoteip_block}
 
 ProxyPass / http://127.0.0.1:${port}/ timeout=${GO_APACHE_TIMEOUT:-60} retry=0
 ProxyPassReverse / http://127.0.0.1:${port}/
-# END VIRTUALMIN-GO ${domain}
+# END VIRTUALMIN-GO-APP ${domain}
 EOF
 }
 
@@ -636,7 +707,7 @@ insert_go_block_into_vhost() {
     fi
     # Sanity: exactly one managed block for this domain.
     local count
-    count="$(grep -c "BEGIN VIRTUALMIN-GO ${domain}" "$tmp_vhost" || true)"
+    count="$(grep -c "BEGIN VIRTUALMIN-GO-APP ${domain}" "$tmp_vhost" || true)"
     [[ "$count" == "1" ]] || { rm -f "$tmp_vhost"; die "Expected 1 Go block, found $count."; }
     mv "$tmp_vhost" "$vhost_file"
     chmod 0644 "$vhost_file"
@@ -646,12 +717,12 @@ insert_go_block_into_vhost() {
 remove_go_block_from_vhost() {
     local vhost_file="$1" domain="$2"
     [[ -f "$vhost_file" ]] || return 0
-    grep -q "BEGIN VIRTUALMIN-GO ${domain}" "$vhost_file" || return 0
+    grep -q "BEGIN VIRTUALMIN-GO-APP ${domain}" "$vhost_file" || return 0
     local tmp_vhost
     tmp_vhost="$(mktemp)"
     awk -v domain="$domain" '
-        /BEGIN VIRTUALMIN-GO/ && index($0, domain) { skip=1; next }
-        /END VIRTUALMIN-GO/ && index($0, domain) { skip=0; next }
+        /BEGIN VIRTUALMIN-GO-APP/ && index($0, domain) { skip=1; next }
+        /END VIRTUALMIN-GO-APP/ && index($0, domain) { skip=0; next }
         !skip { print }
     ' "$vhost_file" > "$tmp_vhost"
     mv "$tmp_vhost" "$vhost_file"
@@ -660,13 +731,13 @@ remove_go_block_from_vhost() {
 
 go_block_present() {
     local vhost_file="$1" domain="$2"
-    [[ -f "$vhost_file" ]] && grep -q "BEGIN VIRTUALMIN-GO ${domain}" "$vhost_file" 2>/dev/null
+    [[ -f "$vhost_file" ]] && grep -q "BEGIN VIRTUALMIN-GO-APP ${domain}" "$vhost_file" 2>/dev/null
 }
 
 create_change_backup() {
     local ts
     ts="$(date +%F-%H%M%S)"
-    local backup_dir="${CHANGE_BASE}/virtualmin-go-change-${ts}"
+    local backup_dir="${CHANGE_BASE}/virtualmin-go-app-change-${ts}"
     mkdir -p "$backup_dir"
     echo "$backup_dir"
 }
@@ -822,8 +893,7 @@ cmd_enable() {
     ensure_go_tree "$duser" "$duser"
     ensure_prod_env "$duser" "$duser" "$port"
     sync_prod_env_port "$port"
-    touch "${GO_APP_ROOT}/go.log" 2>/dev/null || true
-    chown "$duser:$duser" "${GO_APP_ROOT}/go.log" 2>/dev/null || true
+    # Logs go to journald; no app-managed go.log file (legacy file left untouched).
     write_meta_file "$duser" "$duser" "$port" "$proxy_path" "$version" "$health_path" "$deploy_id"
     if [[ -n "$want_toolchain" ]]; then
         toolchain="$(tc_canonical "$want_toolchain")"
@@ -886,6 +956,11 @@ cmd_disable() {
 
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         systemctl stop "$SERVICE_NAME" || warn "Failed to stop $SERVICE_NAME"
+    fi
+    # Disable autostart but keep unit file + registry + all data (releases,
+    # config, data, models). Explicit purge only via remove --purge-data.
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        systemctl disable "$SERVICE_NAME" 2>/dev/null || true
     fi
     if [[ "${APACHE_CONFIG_KIND:-none}" != "none" ]]; then
         remove_go_apache "$APACHE_VHOST_FILE" "$domain" "$backup_dir"
@@ -1000,7 +1075,8 @@ cmd_restart() {
 
 ###############################################################################
 # remove — stop service, drop proxy/unit/registry. Data kept unless
-# --delete-data + explicit confirmation flag (guarded to $SERVER_HOME/apps/go).
+# --purge-data (alias --delete-data) + explicit confirmation flag
+# (guarded to $SERVER_HOME/apps/go).
 ###############################################################################
 cmd_remove() {
     require_root
@@ -1011,8 +1087,8 @@ cmd_remove() {
         case "$1" in
             --domain) domain="$2"; shift 2 ;;
             --keep-data) keep_data=1; delete_data=0; shift ;;
-            --delete-data) delete_data=1; keep_data=0; shift ;;
-            --i-understand-this-deletes-go-data) confirm="yes"; shift ;;
+            --delete-data|--purge-data) delete_data=1; keep_data=0; shift ;;
+            --i-understand-this-deletes-go-data|--i-understand-this-purges-go-data) confirm="yes"; shift ;;
             --json) json=1; shift ;;
             *) shift ;;
         esac
@@ -1055,7 +1131,7 @@ cmd_remove() {
     local data_state="kept"
     if [[ "$delete_data" == "1" ]]; then
         [[ "$confirm" == "yes" ]] || \
-            die "Refusing to delete Go data without --i-understand-this-deletes-go-data"
+            die "Refusing to delete Go data without --i-understand-this-deletes-go-data (alias: --i-understand-this-purges-go-data)"
         assert_safe_app_root "$APP_ROOT" "$HOME"
         # Never delete the containing server home — only apps/go itself.
         [[ "$APP_ROOT" != "$HOME" ]] || die "Refusing: APP_ROOT equals server home."
@@ -1328,6 +1404,10 @@ cmd_deploy() {
     sha="$(sha256sum "$artifact" | awk '{print $1}')"
     [[ -n "$sha" ]] || die "Could not hash artifact."
 
+    # Treat the archive as untrusted input: reject absolute paths,
+    # traversal, device nodes and escaping symlinks BEFORE extraction.
+    validate_artifact_listing "$artifact"
+
     local stage
     stage="$(mktemp -d)"
     tar xzf "$artifact" -C "$stage" || { rm -rf "$stage"; die "Artifact extraction failed."; }
@@ -1396,13 +1476,14 @@ EOF
     chmod 0640 "$dest/deploy.json"
     chown "$duser:$duser" "$dest/deploy.json"
 
-    # Rotate symlinks: previous <- old current id, current <- new release.
-    local old_id=""
+    # previous is updated ONLY after the new release passes health.
+    # Remember both old pointers + old health path; point current at candidate.
+    local old_id="" old_prev="" old_health="${HEALTH_PATH:-$GO_DEFAULT_HEALTH_PATH}"
     if [[ -L "$CURRENT_LINK" ]]; then
         old_id="$(link_id "$CURRENT_LINK")"
-        if release_dir_ok "$old_id"; then
-            set_link "$PREVIOUS_LINK" "$old_id" "$duser"
-        fi
+    fi
+    if [[ -L "$PREVIOUS_LINK" ]]; then
+        old_prev="$(link_id "$PREVIOUS_LINK")"
     fi
     set_link "$CURRENT_LINK" "$rid" "$duser"
 
@@ -1438,6 +1519,16 @@ EOF
     local gate_retries="${GO_HEALTH_RETRIES:-10}"
     [[ "$dep_mode" == "dev" ]] && gate_retries="${GO_DEV_HEALTH_RETRIES:-45}"
     if wait_for_unit_health "$SERVICE_NAME" "$PORT" "$m_health" "$gate_retries"; then
+        # PASS: now promote previous <- old current (rollback target).
+        if [[ -n "$old_id" ]] && release_dir_ok "$old_id"; then
+            set_link "$PREVIOUS_LINK" "$old_id" "$duser"
+        fi
+        # /ready is dependency-aware: verify locally, warn only (health is
+        # the external gate; ready may legitimately lag on first boot).
+        local ready_path="${READY_PATH:-$GO_DEFAULT_READY_PATH}"
+        if ! url_responds_ok "http://${GO_LISTEN_HOST}:${PORT}${ready_path}"; then
+            warn "Health OK but ${ready_path} not ready (deps may still be warming up)."
+        fi
         apply_go_apache "$APACHE_VHOST_FILE" "$domain" "$PORT" "$backup_dir"
         sed -i "s|^APACHE_CONFIG_KIND='.*'|APACHE_CONFIG_KIND='proxy'|" "$registry"
         release_lock 9
@@ -1449,9 +1540,9 @@ EOF
         return 0
     fi
 
-    # Health failed: restore previous release, restart, verify.
+    # Health failed: restore old current, leave previous UNCHANGED.
     warn "Health check failed for $rid — restoring previous release."
-    if release_dir_ok "$old_id"; then
+    if [[ -n "$old_id" ]] && release_dir_ok "$old_id"; then
         set_link "$CURRENT_LINK" "$old_id" "$duser"
         local prev_entry prev_version
         prev_entry="$(manifest_field "$RELEASES_DIR/$old_id/manifest.json" "entrypoint")"
@@ -1474,7 +1565,9 @@ EOF
         sed -i "s|^DEPLOY_ID='.*'|DEPLOY_ID='${old_id}'|" "$registry"
         sed -i "s|^ENTRYPOINT='.*'|ENTRYPOINT='${prev_entry}'|" "$registry"
         sed -i "s|^GO_MODE='.*'|GO_MODE='${rb_mode}'|" "$registry"
-        write_meta_file "$duser" "$duser" "$PORT" "${PROXY_PATH:-/}" "$prev_version" "$m_health" "$old_id"
+        # Failed candidate must not poison the health path: restore old.
+        sed -i "s|^HEALTH_PATH='.*'|HEALTH_PATH='${old_health}'|" "$registry"
+        write_meta_file "$duser" "$duser" "$PORT" "${PROXY_PATH:-/}" "$prev_version" "$old_health" "$old_id"
         rm -rf "${RELEASES_DIR:?}/${rid}"
         release_lock 9
         die "Deploy failed health check; previous release $old_id restored."
@@ -1854,10 +1947,10 @@ cmd_validate() {
             _vcheck "FAIL" "Toolchain does not resolve (pin: ${GO_TOOLCHAIN:-default})"
         fi
         if [[ -f "$SYSTEMD_UNIT" ]]; then
-            local _want_desc="virtualmin-go, ${GO_MODE:-prod}"
+            local _want_desc="virtualmin-go-app, ${GO_MODE:-prod}"
             if grep -q "Description=Go application for ${domain} (${_want_desc})" "$SYSTEMD_UNIT" 2>/dev/null; then
                 _vcheck "PASS" "Unit mode matches registry (${GO_MODE:-prod})"
-            elif [[ "${GO_MODE:-prod}" == "prod" ]] && grep -q "Description=Go application for ${domain} (virtualmin-go)" "$SYSTEMD_UNIT" 2>/dev/null; then
+            elif [[ "${GO_MODE:-prod}" == "prod" ]] && grep -q "Description=Go application for ${domain} (virtualmin-go-app)" "$SYSTEMD_UNIT" 2>/dev/null; then
                 _vcheck "PASS" "Unit mode matches registry (prod, legacy unit)"
             else
                 _vcheck "FAIL" "Unit mode drift (registry: ${GO_MODE:-prod})"
@@ -1896,9 +1989,16 @@ cmd_validate() {
             fi
         fi
         if url_responds_ok "http://${LISTEN_HOST}:${PORT}${HEALTH_PATH:-/health}"; then
-            _vcheck "PASS" "Local health endpoint succeeds"
+            _vcheck "PASS" "Local health endpoint succeeds (${HEALTH_PATH:-/health} = alive)"
         else
             _vcheck "FAIL" "Local health endpoint fails (${HEALTH_PATH:-/health})"
+        fi
+        # /ready is dependency-aware (DB/config/deps); checked locally only,
+        # WARN so a warming dependency never masks a live process.
+        if url_responds_ok "http://${LISTEN_HOST}:${PORT}${READY_PATH:-/ready}"; then
+            _vcheck "PASS" "Local ready endpoint succeeds (${READY_PATH:-/ready} = deps OK)"
+        else
+            _vcheck "WARN" "Local ready endpoint not OK (${READY_PATH:-/ready}; check DB/config locally: curl http://${LISTEN_HOST}:${PORT}${READY_PATH:-/ready})"
         fi
     else
         _vcheck "WARN" "Service not active (state: $(compute_go_state))"
@@ -1913,7 +2013,7 @@ cmd_validate() {
     if [[ "${APACHE_CONFIG_KIND:-none}" == "proxy" ]]; then
         if go_block_present "$APACHE_VHOST_FILE" "$domain"; then
             _vcheck "PASS" "Go proxy block present"
-            if grep -A20 "BEGIN VIRTUALMIN-GO ${domain}" "$APACHE_VHOST_FILE" 2>/dev/null | grep -q "127.0.0.1:${PORT}"; then
+            if grep -A20 "BEGIN VIRTUALMIN-GO-APP ${domain}" "$APACHE_VHOST_FILE" 2>/dev/null | grep -q "127.0.0.1:${PORT}"; then
                 _vcheck "PASS" "Proxy points at expected port"
             else
                 _vcheck "FAIL" "Proxy port mismatch (want $PORT)"
@@ -1921,7 +2021,7 @@ cmd_validate() {
             # /pb/ (PocketBase) must sort before our / catch-all.
             local pb_line go_line
             pb_line="$(grep -n "ProxyPass /pb/" "$APACHE_VHOST_FILE" 2>/dev/null | head -1 | cut -d: -f1 || true)"
-            go_line="$(grep -n "BEGIN VIRTUALMIN-GO ${domain}" "$APACHE_VHOST_FILE" 2>/dev/null | head -1 | cut -d: -f1 || true)"
+            go_line="$(grep -n "BEGIN VIRTUALMIN-GO-APP ${domain}" "$APACHE_VHOST_FILE" 2>/dev/null | head -1 | cut -d: -f1 || true)"
             if [[ -n "$pb_line" && -n "$go_line" ]]; then
                 if [[ "$pb_line" -lt "$go_line" ]]; then
                     _vcheck "PASS" "PocketBase /pb/ sorts before Go /"
@@ -2004,8 +2104,9 @@ cmd_logs() {
         python3 -c "import json,sys; print(json.dumps({'domain':sys.argv[1],'service':sys.argv[2],'lines':sys.argv[3]}))" \
             "$domain" "$SERVICE_NAME" "$out"
     else
+        # journald is the canonical sink; legacy go.log kept as fallback only.
         journalctl -u "$SERVICE_NAME" -n "$lines" --no-pager 2>/dev/null || \
-            tail -n "$lines" "${APP_ROOT}/go.log" 2>/dev/null || echo "No logs available."
+            tail -n "$lines" "${APP_ROOT}/go.log" 2>/dev/null || echo "No journal entries for $SERVICE_NAME (service may never have started)."
     fi
 }
 
@@ -2393,8 +2494,8 @@ cmd_reassign_port() {
             local tmpv
             tmpv="$(mktemp)"
             awk -v domain="$domain" -v new_port="$port" '
-                index($0, "BEGIN VIRTUALMIN-GO " domain) { inblock=1 }
-                index($0, "END VIRTUALMIN-GO " domain) { inblock=0 }
+                index($0, "BEGIN VIRTUALMIN-GO-APP " domain) { inblock=1 }
+                index($0, "END VIRTUALMIN-GO-APP " domain) { inblock=0 }
                 inblock && $1 == "ProxyPass" && $3 ~ /127\.0\.0\.1:/ {
                     sub(/127\.0\.0\.1:[0-9]+/, "127.0.0.1:" new_port)
                 }
@@ -2711,7 +2812,7 @@ cmd_pin_toolchain() {
 
 usage() {
     cat << EOF
-virtualmin-go $SCRIPT_VERSION — versioned Go deployments per Virtualmin server
+virtualmin-go-app $SCRIPT_VERSION — versioned Go deployments per Virtualmin server
 
 Usage: $SCRIPT_NAME <command> [options]
 
@@ -2725,7 +2826,8 @@ Usage: $SCRIPT_NAME <command> [options]
   restart   --domain D
   status    --domain D [--json]
   validate  --domain D [--json]
-  remove    --domain D [--keep-data|--delete-data --i-understand-this-deletes-go-data]
+  remove    --domain D [--keep-data|--purge-data --i-understand-this-deletes-go-data]
+            (alias: --delete-data for --purge-data)
   logs      --domain D [--lines N] [--json]
   releases  --domain D [--json]
   prune-releases --domain D [--keep N]

@@ -1,10 +1,10 @@
 #!/usr/bin/perl
-# virtualmin-go apache_config.cgi — read-only view of the managed proxy
+# virtualmin-go-app apache_config.cgi — read-only view of the managed proxy
 # block, coexistence markers, redirects, and configtest state.
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my $domain = &vgo_request_domain();
@@ -19,9 +19,9 @@ if ($vhost ne '(unknown)' && -f $vhost) {
     open(my $fh, '<', $vhost) || &error("Cannot read vhost: $!");
     my $inblock = 0;
     while (my $line = <$fh>) {
-        $inblock = 1 if index($line, "BEGIN VIRTUALMIN-GO $domain") >= 0;
+        $inblock = 1 if index($line, "BEGIN VIRTUALMIN-GO-APP $domain") >= 0;
         $block .= $line if $inblock;
-        if (index($line, "END VIRTUALMIN-GO $domain") >= 0) { $block .= ''; last; }
+        if (index($line, "END VIRTUALMIN-GO-APP $domain") >= 0) { $block .= ''; last; }
     }
     close($fh);
 }

@@ -10,7 +10,7 @@ feat_backup_name=Go application data and configuration
 feat_module=Virtualmin Go (for managing applications)
 
 # Dependency checks
-feat_check_cli=The CLI manager $1 is not installed. Install the virtualmin-go package first.
+feat_check_cli=The CLI manager $1 is not installed. Install the virtualmin-go-app package first.
 feat_check_systemd=systemd is required but not found.
 feat_check_apache=Apache is required but not found.
 feat_edepweb=Go requires the website feature to be enabled.

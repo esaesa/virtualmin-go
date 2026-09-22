@@ -1,9 +1,9 @@
 #!/usr/bin/perl
-# virtualmin-go status.cgi — machine + human status for one domain
+# virtualmin-go-app status.cgi — machine + human status for one domain
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my $domain = &vgo_request_domain();

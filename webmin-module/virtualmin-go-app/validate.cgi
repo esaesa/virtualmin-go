@@ -1,9 +1,9 @@
 #!/usr/bin/perl
-# virtualmin-go validate.cgi — PASS/WARN/FAIL validation for one domain
+# virtualmin-go-app validate.cgi — PASS/WARN/FAIL validation for one domain
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my $domain = &vgo_request_domain();

@@ -15,9 +15,9 @@
 use strict;
 use warnings;
 our (%text, %config, $module_name);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 
-my $cli = $config{'cli'} || '/usr/local/sbin/virtualmin-go';
+my $cli = $config{'cli'} || '/usr/local/sbin/virtualmin-go-app';
 
 # ── Core ─────────────────────────────────────────────────────────────
 
@@ -87,7 +87,7 @@ sub feature_setup
 my ($d) = @_;
 &virtual_server::obtain_lock_web($d);
 &$virtual_server::first_print(&text('feat_setup', $d->{'dom'}));
-my $registry = "/etc/virtualmin-go/instances.d/".$d->{'dom'}.".conf";
+my $registry = "/etc/virtualmin-go-app/instances.d/".$d->{'dom'}.".conf";
 my ($rc, $out);
 if (-f $registry) {
 	($rc, $out) = &vgo_run('enable', '--domain', $d->{'dom'});
@@ -183,7 +183,7 @@ return $text{'feat_disname'};
 sub feature_clash
 {
 my ($d) = @_;
-my $registry = "/etc/virtualmin-go/instances.d/".$d->{'dom'}.".conf";
+my $registry = "/etc/virtualmin-go-app/instances.d/".$d->{'dom'}.".conf";
 if (-f $registry) {
 	return $text{'feat_clash'};
 	}
@@ -193,7 +193,7 @@ return undef;
 sub feature_import
 {
 my ($dname, $user, $db) = @_;
-my $registry = "/etc/virtualmin-go/instances.d/".$dname.".conf";
+my $registry = "/etc/virtualmin-go-app/instances.d/".$dname.".conf";
 if (-f $registry) {
 	return 1;
 	}
@@ -203,7 +203,7 @@ eval {
 	my $d = &virtual_server::get_domain_by("dom", $dname);
 	$home = $d->{'home'} if ($d && $d->{'home'});
 	};
-if ($home && -d "$home/apps/go" && -f "$home/apps/go/.virtualmin-go.env") {
+if ($home && -d "$home/apps/go" && -f "$home/apps/go/.virtualmin-go-app.env") {
 	return 1;
 	}
 return 0;
@@ -219,7 +219,7 @@ return 0;
 
 sub theme_sections
 {
-my $instances_dir = "/etc/virtualmin-go/instances.d";
+my $instances_dir = "/etc/virtualmin-go-app/instances.d";
 my @instances;
 if (-d $instances_dir) {
 	for my $file (glob("$instances_dir/*.conf")) {
@@ -248,7 +248,7 @@ if ($count > 0) {
 				? 'running' : ($inst->{'ENTRYPOINT'} ? 'deployed' : 'configured');
 			$state = 'disabled' if ($inst->{'ENABLED'} || '1') eq '0';
 			}
-		$html .= "<tr><td><a href='virtualmin-go/status.cgi?domain=".
+		$html .= "<tr><td><a href='virtualmin-go-app/status.cgi?domain=".
 			  &urlize($dom)."'>".&html_escape($dom)."</a></td>".
 			  "<td>".&html_escape($ver)."</td>".
 			  "<td>".&html_escape($port)."</td>".

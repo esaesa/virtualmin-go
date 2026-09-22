@@ -1,0 +1,8 @@
+cli=/usr/local/sbin/virtualmin-go-app
+command_timeout=180
+max_output_bytes=2097152
+max_log_lines=1000
+report_dir=/root/service-reports/virtualmin-go-app
+backup_dir=/root/service-backups/virtualmin-go-app
+lock_dir=/run/lock/virtualmin-go-app-web
+audit_log=/var/log/virtualmin-go-app/web-actions.log

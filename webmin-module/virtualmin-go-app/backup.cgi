@@ -1,10 +1,10 @@
 #!/usr/bin/perl
-# virtualmin-go backup.cgi — create app backups + list history.
+# virtualmin-go-app backup.cgi — create app backups + list history.
 # Restore stays CLI-only in v0.2 (destructive); this page links the command.
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my @instances = &vgo_visible_instances();
@@ -53,6 +53,6 @@ if (@backups) {
 else {
     print "<p>No backups yet for $domain.</p>\n";
 }
-print "<p>Restore is CLI-only in v0.2: <tt>virtualmin-go restore --domain $domain --source FILE.tar.gz</tt></p>\n";
+print "<p>Restore is CLI-only in v0.2: <tt>virtualmin-go-app restore --domain $domain --source FILE.tar.gz</tt></p>\n";
 print "<p><a href='index.cgi'>All instances</a></p>\n";
 &ui_print_footer('index.cgi', 'Go Applications');

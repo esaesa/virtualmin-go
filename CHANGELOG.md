@@ -1,4 +1,43 @@
-# Changelog — virtualmin-go
+# Changelog — virtualmin-go-app
+
+## Unreleased (final-arch refinements + rename, 2026-09-22)
+
+- **Rename `virtualmin-go` → `virtualmin-go-app`** (module manages deployed
+  Go applications). New paths: CLI `/usr/local/sbin/virtualmin-go-app`,
+  config `/etc/virtualmin-go-app`, Webmin module `virtualmin-go-app`,
+  units `virtualmin-go-app-<escaped-domain>.service`, Apache markers
+  `VIRTUALMIN-GO-APP`, toolchains `/opt/virtualmin-go-app/toolchains`
+  (old path symlinked). Both live instances (`api`, `go-test`) migrated
+  with `scripts/migrate-from-virtualmin-go.sh`, validated 0 failures;
+  old registries archived, old units kept disabled for rollback.
+- **journald by default**: units use `StandardOutput/StandardError=journal`
+  (+ `SyslogIdentifier=%N`); no `go.log` file is created. `logs` reads
+  journalctl (legacy file as fallback only). Audit/event logs belong
+  under `data/` if required.
+- **Safe artifact extraction**: `validate_artifact_listing` rejects
+  absolute paths, `..` traversal, device/fifo nodes, and escaping
+  symlinks BEFORE extraction, using raw tar headers via python tarfile
+  (GNU tar sanitizes `tzf` output, so listing text alone is insufficient).
+  Evil archives rejected with zero mutation (proven).
+- **previous-after-health**: `previous` is updated only after the new
+  release passes the health gate; failed deploys restore `current` and
+  leave `previous` untouched. Also fixed health-path poisoning: a failed
+  candidate no longer overwrites registry `HEALTH_PATH` (restored to old
+  value on rollback; proven with broken-health deploy).
+- **systemd-escape naming**: `go_unit_name_for` escapes via
+  `systemd-escape --escape` (sed fallback); normal domains still render
+  naturally (`virtualmin-go-app-api.novel-co.com.service`).
+- **`/health` vs `/ready`**: deploy gates on `/health` (alive), then
+  warns (not fails) if local `/ready` (deps) is not yet OK; `validate`
+  checks both (health FAIL, ready WARN) with a local curl hint.
+- **`remove --purge-data`** alias for `--delete-data` (confirmation flag
+  likewise aliased). `disable` now also runs `systemctl disable` (unit
+  file + registry + data kept).
+- **Backup proof**: native `virtualmin backup-domain` includes
+  `SERVER_HOME/apps/go` (3262 entries on `go-test`, incl. releases,
+  config, data); module `backup` covers releases+config+data+symlinks
+  with `tmp/*` contents excluded. Same tree mechanism covers
+  `apps/pocketbase`.
 
 ## 0.2.0 (2026-09-22)
 
@@ -6,7 +45,7 @@ T1–T4 per locked scope. Toolchain store, source builds, dev mode, owner UI,
 observability — all disposable-proven on `go-test`, production untouched
 (`api` sample intact, PB intact).
 
-- Shared toolchain store `/opt/virtualmin-go/toolchains/<ver>/` + `current`
+- Shared toolchain store `/opt/virtualmin-go-app/toolchains/<ver>/` + `current`
   (compilers are shared tooling like the PB runtime; app binaries stay in
   `apps/go`). Commands: `install-toolchain` (official tarball + SHA-256 vs
   `go.dev/dl/?mode=json`, offline by default), `list-toolchains`,
@@ -53,7 +92,7 @@ observability — all disposable-proven on `go-test`, production untouched
   SHA-256 record, executable/arch check, `current`/`previous` rotation,
   systemd rewrite, health-gated promotion, automatic restore-on-failure.
 - `rollback` swaps `current`/`previous` without touching secrets.
-- systemd `virtualmin-go-<domain>.service` (domain owner, `Restart=on-failure`,
+- systemd `virtualmin-go-app-<domain>.service` (domain owner, `Restart=on-failure`,
   `LimitNOFILE=65535`, `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`
   + `ReadWritePaths=$APP_ROOT`).
 - Transactional Apache `/` proxy coexisting with PocketBase `/pb/`
@@ -65,6 +104,6 @@ observability — all disposable-proven on `go-test`, production untouched
 ## 0.1.2 (2026-09-21)
 
 - Global Settings page (`edit_config.cgi`) parity with PocketBase: validated
-  atomic update of `/etc/virtualmin-go/config` with backup + audit trail.
+  atomic update of `/etc/virtualmin-go-app/config` with backup + audit trail.
   Guardrails: loopback-only listener, no overlap with PB 18000–18999,
   retention >= 2. Never touches instance secrets.

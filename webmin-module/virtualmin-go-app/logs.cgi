@@ -1,9 +1,9 @@
 #!/usr/bin/perl
-# virtualmin-go logs.cgi — per-domain service log viewer (read-only).
+# virtualmin-go-app logs.cgi — per-domain service log viewer (read-only).
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my @instances = &vgo_visible_instances();

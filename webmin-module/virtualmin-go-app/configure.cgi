@@ -1,11 +1,11 @@
 #!/usr/bin/perl
-# virtualmin-go configure.cgi — per-instance safe settings (pin, paths,
+# virtualmin-go-app configure.cgi — per-instance safe settings (pin, paths,
 # port) + post-change validation. Mirrors PB configure.cgi shape.
 # Never touches secrets, releases, or other plugins' config.
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my $domain = &vgo_request_domain();

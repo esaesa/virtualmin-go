@@ -1,9 +1,9 @@
 #!/usr/bin/perl
-# virtualmin-go releases.cgi — per-domain release table + rollback/prune.
+# virtualmin-go-app releases.cgi — per-domain release table + rollback/prune.
 use strict;
 use warnings;
 our (%in, %text);
-do 'virtualmin-go-lib.pl';
+do 'virtualmin-go-app-lib.pl';
 &ReadParse();
 
 my $domain = &vgo_request_domain();
