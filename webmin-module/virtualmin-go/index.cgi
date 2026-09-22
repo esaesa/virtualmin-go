@@ -37,4 +37,16 @@ print "<p><a href='deploy.cgi'>Deploy a release</a> | ".
       "<a href='operations.cgi'>Operations</a> | ".
       "<a href='backup.cgi'>Backups</a> | ".
       "<a href='edit_config.cgi'>Global settings</a></p>\n";
+my @audit = &vgo_recent_audit(10, '');
+if (@audit) {
+    print "<h3>Recent module activity</h3>\n";
+    print "<table class='ui_table' width='100%'>\n";
+    print "<tr><th>Time</th><th>User</th><th>Action</th><th>Domain</th><th>Result</th></tr>\n";
+    for my $e (@audit) {
+        print "<tr><td>".vgo_html($e->{'timestamp'} || '')."</td><td>".vgo_html($e->{'user'} || '')."</td>".
+              "<td>".vgo_html($e->{'action'} || '')."</td><td>".vgo_html($e->{'domain'} || '-')."</td>".
+              "<td>".vgo_html($e->{'result'} || '')."</td></tr>\n";
+    }
+    print "</table>\n";
+}
 &ui_print_footer('/', 'Webmin');

@@ -23,6 +23,12 @@ if ($json) {
 }
 
 print "<p><a href='validate.cgi?domain=".&vgo_url($domain)."'>Validate</a> | ".
+      "<a href='configure.cgi?domain=".&vgo_url($domain)."'>Configure</a> | ".
+      "<a href='releases.cgi?domain=".&vgo_url($domain)."'>Releases</a> | ".
+      "<a href='apache_config.cgi?domain=".&vgo_url($domain)."'>Apache</a> | ".
+      "<a href='logs.cgi?domain=".&vgo_url($domain)."'>Logs</a> | ".
+      "<a href='deploy.cgi?domain=".&vgo_url($domain)."'>Deploy</a> | ".
+      "<a href='open.cgi?domain=".&vgo_url($domain)."' target='_blank'>Open site</a> | ".
       "<a href='index.cgi'>All instances</a></p>\n";
 
 &ui_print_footer('index.cgi', 'Go Applications');

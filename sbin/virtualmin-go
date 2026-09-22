@@ -289,7 +289,8 @@ ensure_prod_env() {
         cat > "$GO_PROD_ENV" << EOF
 # Managed by virtualmin-go. Secrets and app environment live here.
 # This file is NEVER overwritten by deploy or rollback.
-# Add your application secrets below (KEY=value, one per line).
+# GO_ADDR/GO_PORT below are module-managed (port allocation owns them);
+# add your own application secrets/variables on new lines.
 GO_ADDR='${GO_LISTEN_HOST}:${port}'
 GO_PORT='${port}'
 EOF
@@ -298,6 +299,25 @@ EOF
     else
         chown "$user:$group" "$GO_PROD_ENV"
         chmod 0600 "$GO_PROD_ENV"
+    fi
+}
+
+# GO_ADDR/GO_PORT are module-managed (unit Environment= AND production.env
+# must agree — systemd gives EnvironmentFile the final word, so both are
+# rewritten together on every port change; user secrets on other lines
+# are never touched).
+sync_prod_env_port() {
+    local port="$1"
+    [[ -f "$GO_PROD_ENV" ]] || return 0
+    if grep -q "^GO_ADDR=" "$GO_PROD_ENV" 2>/dev/null; then
+        sed -i "s|^GO_ADDR=.*|GO_ADDR='${GO_LISTEN_HOST}:${port}'|" "$GO_PROD_ENV"
+    else
+        echo "GO_ADDR='${GO_LISTEN_HOST}:${port}'" >> "$GO_PROD_ENV"
+    fi
+    if grep -q "^GO_PORT=" "$GO_PROD_ENV" 2>/dev/null; then
+        sed -i "s|^GO_PORT=.*|GO_PORT='${port}'|" "$GO_PROD_ENV"
+    else
+        echo "GO_PORT='${port}'" >> "$GO_PROD_ENV"
     fi
 }
 
@@ -801,6 +821,7 @@ cmd_enable() {
 
     ensure_go_tree "$duser" "$duser"
     ensure_prod_env "$duser" "$duser" "$port"
+    sync_prod_env_port "$port"
     touch "${GO_APP_ROOT}/go.log" 2>/dev/null || true
     chown "$duser:$duser" "${GO_APP_ROOT}/go.log" 2>/dev/null || true
     write_meta_file "$duser" "$duser" "$port" "$proxy_path" "$version" "$health_path" "$deploy_id"
@@ -1391,6 +1412,7 @@ EOF
     VGO_DEV_PACKAGE="$dep_pkg" write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$duser" "$duser" \
         "$entry_abs" "$PORT" "$dep_mode" "$tc_bin"
     ensure_prod_env "$duser" "$duser" "$PORT"
+    sync_prod_env_port "$PORT"
 
     # Persist release metadata (secrets file untouched).
     heal_registry_fields "$registry"
@@ -2212,6 +2234,202 @@ cmd_version() {
 }
 
 ###############################################################################
+# precheck — read-only environment prerequisites (mirrors PB precheck).
+###############################################################################
+cmd_precheck() {
+    load_config
+    local json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    local failures=0 first=1
+    _pcheck() {
+        local status="$1" msg="$2"
+        if [[ "$json" == "1" ]]; then
+            [[ "$first" == "1" ]] && first=0 || printf ','
+            printf '{"status":"%s","check":"%s"}' "$status" "$msg"
+        else
+            printf "%-4s %s\n" "$status" "$msg"
+        fi
+        [[ "$status" == "FAIL" ]] && ((failures++)) || true
+    }
+    [[ "$json" == "1" ]] && printf '{"checks":['
+    if [[ "$(id -u)" -eq 0 ]]; then _pcheck "PASS" "Running as root";
+    else _pcheck "FAIL" "Not running as root (mutating commands need root)"; fi
+    if command -v virtualmin &>/dev/null; then _pcheck "PASS" "Virtualmin CLI present";
+    else _pcheck "FAIL" "Virtualmin CLI missing"; fi
+    if [[ -x /bin/systemctl || -x /usr/bin/systemctl ]]; then _pcheck "PASS" "systemd present";
+    else _pcheck "FAIL" "systemd missing"; fi
+    if command -v apachectl &>/dev/null; then
+        if apachectl configtest 2>/dev/null; then _pcheck "PASS" "Apache present, config valid";
+        else _pcheck "FAIL" "Apache configtest fails"; fi
+    else
+        _pcheck "FAIL" "apachectl missing"
+    fi
+    local missing_tools=""
+    for t in curl tar sha256sum python3 file ss; do
+        command -v "$t" &>/dev/null || missing_tools+="$t "
+    done
+    if [[ -z "$missing_tools" ]]; then _pcheck "PASS" "Helper tools present (curl tar sha256sum python3 file ss)";
+    else _pcheck "FAIL" "Missing helper tools: $missing_tools"; fi
+    if command -v git &>/dev/null && command -v runuser &>/dev/null; then
+        _pcheck "PASS" "Source-build tools present (git runuser)"
+    else
+        _pcheck "WARN" "git/runuser missing — source builds unavailable (artifacts still work)"
+    fi
+    if mkdir -p "$TOOLCHAINS_BASE" 2>/dev/null && [[ -w "$TOOLCHAINS_BASE" ]]; then
+        _pcheck "PASS" "Toolchain store writable ($TOOLCHAINS_BASE)"
+    else
+        _pcheck "FAIL" "Toolchain store not writable ($TOOLCHAINS_BASE)"
+    fi
+    if mkdir -p "$INSTANCES_DIR" 2>/dev/null && [[ -w "$INSTANCES_DIR" ]]; then
+        _pcheck "PASS" "Registry dir writable ($INSTANCES_DIR)"
+    else
+        _pcheck "FAIL" "Registry dir not writable ($INSTANCES_DIR)"
+    fi
+    local free=0 p used
+    used="$(grep -h "^PORT=" "$INSTANCES_DIR"/*.conf 2>/dev/null | cut -d"'" -f2 || true)"
+    for (( p=GO_BASE_PORT; p<=GO_MAX_PORT; p++ )); do
+        echo "$used" | grep -qw "$p" && continue
+        ss -ltn 2>/dev/null | grep -q "127.0.0.1:${p}" && continue
+        free=$((free+1))
+    done
+    if [[ "$free" -gt 0 ]]; then _pcheck "PASS" "$free free port(s) in $GO_BASE_PORT-$GO_MAX_PORT";
+    else _pcheck "FAIL" "No free ports in $GO_BASE_PORT-$GO_MAX_PORT"; fi
+    local avail_kb
+    avail_kb="$(df -k /opt 2>/dev/null | awk 'NR==2{print $4}')"
+    if [[ -n "$avail_kb" && "$avail_kb" -gt 524288 ]]; then
+        _pcheck "PASS" "/opt has $((avail_kb/1024)) MiB free (toolchains need ~500 MiB each)"
+    else
+        _pcheck "WARN" "/opt low on space (${avail_kb:-unknown} KiB)"
+    fi
+    if curl -fsSL --max-time 10 -o /dev/null "$GO_DL_FEED" 2>/dev/null; then
+        _pcheck "PASS" "go.dev reachable (online toolchain/source fetch OK)"
+    else
+        _pcheck "WARN" "go.dev unreachable — only offline/pre-staged flows work"
+    fi
+    if [[ -n "$(current_tc_version)" ]]; then
+        _pcheck "PASS" "Default toolchain set ($(current_tc_version))"
+    else
+        _pcheck "WARN" "No default toolchain (install one before source builds)"
+    fi
+    if [[ "$json" == "1" ]]; then
+        local ok="false"
+        [[ $failures -eq 0 ]] && ok="true"
+        printf '],"ok":%s,"failures":%s}\n' "$ok" "$failures"
+    else
+        echo
+        echo "Precheck: $failures failures"
+    fi
+    [[ $failures -eq 0 ]] && return 0 || return 1
+}
+
+###############################################################################
+# reassign-port — move an instance within 18100-18199 (own markers only).
+###############################################################################
+cmd_reassign_port() {
+    require_root
+    load_config
+    local domain="" port="" json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --port) port="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$domain" ]] || die "--domain is required"
+    validate_domain_arg "$domain"
+    get_domain_lock "$domain"
+    local registry="${INSTANCES_DIR}/${domain}.conf"
+    [[ -f "$registry" ]] || die "No registry for $domain."
+    # shellcheck source=/dev/null
+    source "$registry"
+    build_go_paths "$HOME"
+    assert_safe_app_root "$APP_ROOT" "$HOME"
+    if [[ -z "$port" ]]; then
+        port="$(alloc_go_port)"
+    fi
+    [[ "$port" =~ ^[0-9]+$ ]] || die "Invalid port: $port"
+    [[ "$port" -ge "$GO_BASE_PORT" && "$port" -le "$GO_MAX_PORT" ]] || \
+        die "Port $port outside Go range $GO_BASE_PORT-$GO_MAX_PORT."
+    local other
+    other="$(grep -l "^PORT='$port'" "$INSTANCES_DIR"/*.conf 2>/dev/null | grep -v "$domain.conf" || true)"
+    [[ -z "$other" ]] || die "Port $port already claimed by another Go instance."
+    if ss -ltn 2>/dev/null | awk '/127\.0\.0\.1:/ {gsub(/.*:/,"",$4); print $4}' | grep -qw "$port"; then
+        die "Port $port already listening on 127.0.0.1."
+    fi
+    local old_port="$PORT"
+    [[ "$port" != "$old_port" ]] || die "Already on port $port."
+    local backup_dir
+    backup_dir="$(create_change_backup)"
+    add_changed_file "$backup_dir" "$registry"
+    [[ -f "$SYSTEMD_UNIT" ]] && add_changed_file "$backup_dir" "$SYSTEMD_UNIT"
+    add_changed_file "$backup_dir" "$APACHE_VHOST_FILE"
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    wait_for_port_free "$old_port" 15 || true
+    sed -i "s|^PORT='.*'|PORT='${port}'|" "$registry"
+    local rmode rbin rentry rpkg
+    rmode="${GO_MODE:-prod}"
+    rentry="${ENTRYPOINT:-}"
+    rpkg="$(deploy_field "$RELEASES_DIR/$DEPLOY_ID" "go_package" 2>/dev/null || true)"
+    [[ -n "$rpkg" ]] || rpkg="."
+    rbin=""
+    if [[ "$rmode" == "dev" ]]; then
+        local rtc
+        rtc="$(resolve_tc_for_domain "${GO_TOOLCHAIN:-}")"
+        rbin="$(tc_dir_for "$rtc")/bin/go"
+    fi
+    VGO_DEV_PACKAGE="$rpkg" write_go_systemd_unit "$SYSTEMD_UNIT" "$domain" "$USER" "$USER" \
+        "${APP_ROOT}/current/${rentry}" "$port" "$rmode" "$rbin"
+    ensure_prod_env "$USER" "$USER" "$port"
+    sync_prod_env_port "$port"
+    if [[ "${APACHE_CONFIG_KIND:-none}" == "proxy" ]]; then
+        if go_block_present "$APACHE_VHOST_FILE" "$domain"; then
+            local tmpv
+            tmpv="$(mktemp)"
+            awk -v domain="$domain" -v new_port="$port" '
+                index($0, "BEGIN VIRTUALMIN-GO " domain) { inblock=1 }
+                index($0, "END VIRTUALMIN-GO " domain) { inblock=0 }
+                inblock && $1 == "ProxyPass" && $3 ~ /127\.0\.0\.1:/ {
+                    sub(/127\.0\.0\.1:[0-9]+/, "127.0.0.1:" new_port)
+                }
+                inblock && $1 == "ProxyPassReverse" && $3 ~ /127\.0\.0\.1:/ {
+                    sub(/127\.0\.0\.1:[0-9]+/, "127.0.0.1:" new_port)
+                }
+                { print }
+            ' "$APACHE_VHOST_FILE" > "$tmpv" && mv "$tmpv" "$APACHE_VHOST_FILE"
+            chmod 0644 "$APACHE_VHOST_FILE"
+            apache_configtest_or_restore "$backup_dir" "$APACHE_VHOST_FILE"
+            safe_reload_apache || true
+        fi
+    fi
+    local meta_ver meta_health meta_proxy meta_id
+    meta_ver="${CURRENT_VERSION:-}"; meta_health="${HEALTH_PATH:-/health}"
+    meta_proxy="${PROXY_PATH:-/}"; meta_id="${DEPLOY_ID:-}"
+    write_meta_file "$USER" "$USER" "$port" "$meta_proxy" "$meta_ver" "$meta_health" "$meta_id"
+    systemd_daemon_reload
+    systemctl start "$SERVICE_NAME" 2>/dev/null || warn "Start signal sent with warnings."
+    local gate_retries="${GO_HEALTH_RETRIES:-10}"
+    [[ "$rmode" == "dev" ]] && gate_retries="${GO_DEV_HEALTH_RETRIES:-45}"
+    if wait_for_unit_health "$SERVICE_NAME" "$port" "$meta_health" "$gate_retries"; then
+        release_lock 9
+        if [[ "$json" == "1" ]]; then
+            echo '{"ok":true,"domain":"'"$domain"'","old_port":'"$old_port"',"port":'"$port"'}'
+        else
+            info "Port reassigned $domain: $old_port -> $port."
+        fi
+        return 0
+    fi
+    release_lock 9
+    die "Port reassigned but health check failed on $port (service may need attention)."
+}
+
+###############################################################################
 # T1 — Shared Go toolchain store (/opt, compilers are shared tooling)
 ###############################################################################
 valid_tc_version() {
@@ -2511,6 +2729,8 @@ Usage: $SCRIPT_NAME <command> [options]
   logs      --domain D [--lines N] [--json]
   releases  --domain D [--json]
   prune-releases --domain D [--keep N]
+  precheck [--json]
+  reassign-port --domain D [--port P]
   backup    --domain D --dest FILE.tar.gz
   restore   --domain D --source FILE.tar.gz
   install-toolchain (--version V | --latest) [--set-current] [--allow-online]
@@ -2540,6 +2760,8 @@ main() {
         logs) cmd_logs "$@" ;;
         releases) cmd_releases "$@" ;;
         prune-releases) cmd_prune_releases "$@" ;;
+        precheck) cmd_precheck "$@" ;;
+        reassign-port) cmd_reassign_port "$@" ;;
         backup) cmd_backup "$@" ;;
         restore) cmd_restore "$@" ;;
         install-toolchain) cmd_install_toolchain "$@" ;;
