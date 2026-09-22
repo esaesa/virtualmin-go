@@ -1,6 +1,10 @@
 # Changelog — virtualmin-go
 
-## Unreleased — v0.2 (T1 toolchain store + T2 source builds, disposable-proven)
+## 0.2.0 (2026-09-22)
+
+T1–T4 per locked scope. Toolchain store, source builds, dev mode, owner UI,
+observability — all disposable-proven on `go-test`, production untouched
+(`api` sample intact, PB intact).
 
 - Shared toolchain store `/opt/virtualmin-go/toolchains/<ver>/` + `current`
   (compilers are shared tooling like the PB runtime; app binaries stay in

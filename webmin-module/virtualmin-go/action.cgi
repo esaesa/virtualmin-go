@@ -8,7 +8,7 @@ do 'virtualmin-go-lib.pl';
 
 my $domain = &vgo_request_domain();
 &error('No valid domain was specified.') if !$domain;
-my $inst = &vgo_assert_instance($domain);
+my $inst = &vgo_assert_visible($domain);
 my $action = $in{'action'} || '';
 &error('Unknown action.') if $action !~ /^(restart|rollback|prune-releases|start|stop)$/;
 

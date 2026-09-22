@@ -8,7 +8,7 @@ do 'virtualmin-go-lib.pl';
 
 my $domain = &vgo_request_domain();
 &error('No valid domain was specified.') if !$domain;
-my $inst = &vgo_assert_instance($domain);
+my $inst = &vgo_assert_visible($domain);
 
 &ui_print_header(undef, "Go Validate: $domain", '', 'go');
 

@@ -56,7 +56,7 @@ our $CLI = $config{'cli'} || '/usr/local/sbin/virtualmin-go';
 our $CONFIG_FILE = $ENV{'VGO_CONFIG_FILE'} || '/etc/virtualmin-go/config';
 our $INSTANCES_DIR = $ENV{'VGO_INSTANCES_DIR'} || '/etc/virtualmin-go/instances.d';
 
-sub vgo_version { return '0.1.2'; }
+sub vgo_version { return '0.2.0'; }
 sub vgo_now_iso { return strftime('%Y-%m-%dT%H:%M:%S%z', localtime()); }
 sub vgo_stamp { return strftime('%Y%m%d-%H%M%S', localtime()); }
 
@@ -246,6 +246,8 @@ sub vgo_command_rules
         'logs'           => 0,
         'releases'       => 0,
         'list'           => 0,
+        'list-toolchains'=> 0,
+        'check-updates'  => 0,
         'enable'         => 1,
         'disable'        => 1,
         'restart'        => 1,
@@ -254,7 +256,102 @@ sub vgo_command_rules
         'backup'         => 1,
         'restore'        => 1,
         'remove'         => 1,
+        'deploy'         => 1,
+        'pin-toolchain'  => 1,
+        'install-toolchain' => 1,
+        'set-current-toolchain' => 1,
+        'remove-toolchain' => 1,
     };
+}
+
+# ── Owner scoping ────────────────────────────────────────────────────
+# Master admins see every instance. Domain owners (Webmin login = Unix
+# owner name) see only instances owned by their Unix user. PocketBase
+# has no equivalent filter (module-ACL-only); Go needs it because owners
+# deploy from this UI.
+
+sub vgo_current_user
+{
+    return $ENV{'REMOTE_USER'} || $remote_user || '';
+}
+
+sub vgo_is_master
+{
+    my $am = eval { &virtual_server::master_admin() };
+    return $am ? 1 : 0 if defined($am);
+    return 1 if vgo_current_user() eq 'root';
+    return 1 if $> == 0 && vgo_current_user() eq '';
+    return 0;
+}
+
+sub vgo_visible_instances
+{
+    my @all = vgo_list_instances();
+    return @all if vgo_is_master();
+    my $u = vgo_current_user();
+    return grep { ($_->{'USER'} || '') eq $u } @all;
+}
+
+sub vgo_assert_visible
+{
+    my ($domain) = @_;
+    my $inst = vgo_assert_instance($domain);
+    return $inst if vgo_is_master();
+    my $u = vgo_current_user();
+    &error("Domain $domain is not owned by $u.") if ($inst->{'USER'} || '') ne $u;
+    return $inst;
+}
+
+sub vgo_require_master
+{
+    my ($label) = @_;
+    $label ||= 'operation';
+    &error("The $label requires a master administrator.") if !vgo_is_master();
+}
+
+sub vgo_backup_dir_for
+{
+    my ($domain) = @_;
+    return vgo_backup_dir()."/$domain";
+}
+
+sub vgo_list_backups
+{
+    my ($domain) = @_;
+    my $dir = vgo_backup_dir_for($domain);
+    my @items;
+    return @items if !-d $dir;
+    opendir(my $dh, $dir) || return @items;
+    for my $entry (readdir($dh)) {
+        next if $entry !~ /^[A-Za-z0-9_.-]+\.tar\.gz$/;
+        my $path = "$dir/$entry";
+        next if !-f $path || -l $path;
+        push(@items, { name => $entry, path => $path, size => (-s $path || 0), mtime => ((stat($path))[9] || 0) });
+    }
+    closedir($dh);
+    @items = sort { $b->{'mtime'} <=> $a->{'mtime'} } @items;
+    splice(@items, 200) if @items > 200;
+    return @items;
+}
+
+sub vgo_new_backup_path
+{
+    my ($domain) = @_;
+    my $dir = vgo_backup_dir_for($domain);
+    my ($ok, $err) = vgo_ensure_dir($dir, 0700);
+    return (undef, $err) if !$ok;
+    return ("$dir/${domain}-go-backup-".vgo_stamp().'.tar.gz', '');
+}
+
+sub vgo_nice_size
+{
+    my ($bytes) = @_;
+    return '-' if !defined($bytes) || $bytes !~ /^\d+$/;
+    my @units = qw(B KiB MiB GiB TiB);
+    my $value = $bytes + 0;
+    my $i = 0;
+    while ($value >= 1024 && $i < $#units) { $value /= 1024; $i++; }
+    return $i ? sprintf('%.1f %s', $value, $units[$i]) : "$value B";
 }
 
 sub vgo_audit

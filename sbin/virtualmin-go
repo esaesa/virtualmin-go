@@ -1642,17 +1642,23 @@ cmd_status() {
     fi
     local state
     state="$(compute_go_state)"
+    local eff_tc
+    eff_tc="$(resolve_tc_for_domain "${GO_TOOLCHAIN:-}" 2>/dev/null)" || eff_tc="(none)"
 
     if [[ "$json" == "1" ]]; then
-        printf '{"domain":"%s","state":"%s","server_home":"%s","app_root":"%s","version":"%s","release":"%s","port":%s,"listen":"%s:%s","health":"%s","service":"%s","proxy":"%s"}\n' \
+        printf '{"domain":"%s","state":"%s","server_home":"%s","app_root":"%s","version":"%s","release":"%s","port":%s,"listen":"%s:%s","health":"%s","service":"%s","proxy":"%s","go_mode":"%s","go_toolchain":"%s","toolchain_pin":"%s","source_url":"%s","source_commit":"%s"}\n' \
             "$DOMAIN" "$state" "$HOME" "$APP_ROOT" "${CURRENT_VERSION:-}" "${DEPLOY_ID:-}" \
-            "$PORT" "$LISTEN_HOST" "$PORT" "$http_ok" "$svc" "$marker"
+            "$PORT" "$LISTEN_HOST" "$PORT" "$http_ok" "$svc" "$marker" \
+            "${GO_MODE:-prod}" "$eff_tc" "${GO_TOOLCHAIN:-default}" "${SOURCE_URL:-}" "${SOURCE_COMMIT:-}"
     else
         echo "Domain:      $DOMAIN"
         echo "State:       $state"
         echo "Server home: $HOME"
         echo "App root:    $APP_ROOT"
         echo "Version:     ${CURRENT_VERSION:-(none)} (${DEPLOY_ID:-(none)})"
+        echo "Mode:        ${GO_MODE:-prod}"
+        echo "Toolchain:   $eff_tc (pin: ${GO_TOOLCHAIN:-default})"
+        [[ -n "${SOURCE_URL:-}" ]] && echo "Source:      $SOURCE_URL @ ${SOURCE_COMMIT:-(branch ${SOURCE_BRANCH:-default})}"
         echo "Listen:      ${LISTEN_HOST}:${PORT}"
         echo "Service:     $SERVICE_NAME ($svc)"
         echo "Port listening: $port_ok"
@@ -1806,13 +1812,43 @@ cmd_validate() {
         [[ "$svc_user" == "$USER" ]] && _vcheck "PASS" "Unit user correct" || \
             _vcheck "FAIL" "Unit user mismatch (want $USER, got ${svc_user:-(none)})"
         svc_wd="$(systemctl show "$SERVICE_NAME" --property=WorkingDirectory --value 2>/dev/null || true)"
-        [[ "$svc_wd" == "$APP_ROOT" ]] && _vcheck "PASS" "Unit WorkingDirectory correct" || \
+        local want_wd="$APP_ROOT"
+        [[ "${GO_MODE:-prod}" == "dev" ]] && want_wd="$APP_ROOT/current/src"
+        [[ "$svc_wd" == "$want_wd" ]] && _vcheck "PASS" "Unit WorkingDirectory correct" || \
             _vcheck "FAIL" "Unit WorkingDirectory mismatch (got ${svc_wd:-(none)})"
         grep -q "EnvironmentFile=${PROD_ENV}" "$SYSTEMD_UNIT" 2>/dev/null && \
             _vcheck "PASS" "Unit uses production.env" || _vcheck "FAIL" "Unit missing EnvironmentFile"
     else
         if [[ "$release_ok" == "1" ]]; then _vcheck "FAIL" "systemd unit missing"; else _vcheck "WARN" "No unit yet (no release)"; fi
     fi
+
+    # Toolchain: pin resolves, unit mode matches registry.
+    {
+        local _tc
+        _tc="$(resolve_tc_for_domain "${GO_TOOLCHAIN:-}" 2>/dev/null)" || _tc=""
+        if [[ -n "$_tc" ]]; then
+            _vcheck "PASS" "Toolchain resolves ($_tc, pin: ${GO_TOOLCHAIN:-default})"
+        else
+            _vcheck "FAIL" "Toolchain does not resolve (pin: ${GO_TOOLCHAIN:-default})"
+        fi
+        if [[ -f "$SYSTEMD_UNIT" ]]; then
+            local _want_desc="virtualmin-go, ${GO_MODE:-prod}"
+            if grep -q "Description=Go application for ${domain} (${_want_desc})" "$SYSTEMD_UNIT" 2>/dev/null; then
+                _vcheck "PASS" "Unit mode matches registry (${GO_MODE:-prod})"
+            elif [[ "${GO_MODE:-prod}" == "prod" ]] && grep -q "Description=Go application for ${domain} (virtualmin-go)" "$SYSTEMD_UNIT" 2>/dev/null; then
+                _vcheck "PASS" "Unit mode matches registry (prod, legacy unit)"
+            else
+                _vcheck "FAIL" "Unit mode drift (registry: ${GO_MODE:-prod})"
+            fi
+        fi
+        if [[ -n "${SOURCE_URL:-}" ]]; then
+            if [[ -n "${SOURCE_COMMIT:-}" ]]; then
+                _vcheck "PASS" "Source commit recorded (${SOURCE_COMMIT})"
+            else
+                _vcheck "WARN" "Source URL set but no commit recorded"
+            fi
+        fi
+    }
 
     # Port
     if [[ "$PORT" -ge "$GO_BASE_PORT" ]] && [[ "$PORT" -le "$GO_MAX_PORT" ]]; then

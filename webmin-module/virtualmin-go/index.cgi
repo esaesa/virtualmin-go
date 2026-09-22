@@ -8,7 +8,7 @@ do 'virtualmin-go-lib.pl';
 
 &ui_print_header(undef, 'Go Applications', '', 'go');
 
-my @instances = &vgo_list_instances();
+my @instances = &vgo_visible_instances();
 print "<p>".scalar(@instances)." Go application(s) configured. Ports 18100-18199.</p>\n";
 if (@instances) {
     print "<table class='ui_table' width='100%'>\n";
@@ -32,5 +32,9 @@ else {
     print "<p>No Go instances yet. Enable the Go feature on a Virtualmin server, then deploy an artifact.</p>\n";
 }
 
-print "<p><a href='edit_config.cgi'>Global settings</a></p>\n";
+print "<p><a href='deploy.cgi'>Deploy a release</a> | ".
+      "<a href='toolchains.cgi'>Toolchains</a> | ".
+      "<a href='operations.cgi'>Operations</a> | ".
+      "<a href='backup.cgi'>Backups</a> | ".
+      "<a href='edit_config.cgi'>Global settings</a></p>\n";
 &ui_print_footer('/', 'Webmin');

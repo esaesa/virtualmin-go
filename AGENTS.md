@@ -36,6 +36,8 @@ The module owns ONLY these, and changes them only through module code:
 - `/etc/virtualmin-go/instances.d/*.conf` (registries)
 - `/etc/systemd/system/virtualmin-go-*.service` (units)
 - Lines between `BEGIN/END VIRTUALMIN-GO <domain>` inside the `:443` vhost
+- `/opt/virtualmin-go/toolchains/**` (shared compilers — same category as
+  the PocketBase runtime; official tarballs + SHA-256 verified)
 
 Everything else is Virtualmin-owned: vhost structure, `:80` content,
 scheme/host redirects, SSL directives, `/.well-known`, webmail/admin rules.

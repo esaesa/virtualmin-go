@@ -1,5 +1,5 @@
 desc=Go Application Deployments
-version=0.1.2
+version=0.2.0
 category=servers
 depends=virtual-server/4.13
 os_support=*-linux
